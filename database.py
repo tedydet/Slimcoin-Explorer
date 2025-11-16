@@ -6,7 +6,6 @@ import os
 from decimal import Decimal
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
-import time
 
 # Reusable HTTP session for RPC calls
 from requests.adapters import HTTPAdapter
