@@ -46,9 +46,14 @@ TX_BATCH_CHUNK = int(os.getenv("TX_BATCH_CHUNK", "200"))
 GETBLOCK_VERBOSE = os.getenv("GETBLOCK_VERBOSE", "auto").lower()  # "auto", "0", "1", "2"
 GETBLOCK_VERBOSE_MODE = None  # resolved to: 'ids_only' | 'txinfo' | 'txinfo_details'
 
+# Prefetch pipeline config
+PREFETCH_WORKERS = int(os.getenv("PREFETCH_WORKERS", "3"))  # parallel RPC workers for prefetch
+PREFETCH_DEPTH = int(os.getenv("PREFETCH_DEPTH", "3"))      # how many batches to keep in flight
+
 # Incremental update tunables
 INCR_COMMIT_EVERY = int(os.getenv("INCR_COMMIT_EVERY", "1"))  # commit every N blocks during incremental updates
 REINDEX_LOCK_STALE_SECS = int(os.getenv("REINDEX_LOCK_STALE_SECS", "7200"))  # treat lock older than 2h as stale
+CONTINUE_REWIND = int(os.getenv("CONTINUE_REWIND", "10"))
 
 DATABASE = 'blockchain.db'
 PEERS = 'peers.db'
@@ -196,6 +201,18 @@ def batch_getblocks_verbose_auto(hashes, mode: str):
     return out
 
 
+# --- Helper to resolve getblock verbose mode without mutating a global ---
+def resolve_verbose_mode():
+    """
+    Compute the desired getblock verbosity without using or mutating globals.
+    """
+    m = (GETBLOCK_VERBOSE or "auto").strip().lower()
+    if m in ("auto", ""):
+        return detect_getblock_verbose_mode()
+    mapping = {"0": "ids_only", "false": "ids_only", "1": "txinfo", "true": "txinfo", "2": "txinfo_details"}
+    return mapping.get(m, "ids_only")
+
+
 # --- Prefetch pipeline helpers ---
 def _fetch_block_batch(heights, mode):
     """
@@ -211,6 +228,41 @@ def _fetch_block_batch(heights, mode):
     hash_list = [hh for _, hh in valid_pairs]
     blocks = batch_getblocks_verbose_auto(hash_list, mode) if hash_list else []
     return valid_pairs, blocks
+
+
+# FIFO multi-future prefetch pipeline helper
+def _prefetch_pipeline_iter(start_h, end_h, mode, batch_size, executor, depth):
+    """
+    Yield (valid_pairs, blocks) for contiguous height batches while keeping up to `depth`
+    batches in flight using `executor`. Order is preserved (FIFO).
+    """
+    cur = start_h
+    in_flight = []
+
+    # Prime the pipeline
+    while cur <= end_h and len(in_flight) < max(1, depth):
+        heights = list(range(cur, min(cur + batch_size - 1, end_h) + 1))
+        fut = executor.submit(_fetch_block_batch, heights, mode)
+        in_flight.append((heights[0], heights[-1], fut))
+        cur = heights[-1] + 1
+
+    # Drain while maintaining depth
+    while in_flight:
+        first_h, last_h, fut = in_flight.pop(0)
+        try:
+            valid_pairs, blocks = fut.result()
+        except Exception as e:
+            print(f"Prefetch failed for heights {first_h}..{last_h}: {e}")
+            valid_pairs, blocks = [], []
+
+        # Keep pipeline filled
+        if cur <= end_h:
+            heights = list(range(cur, min(cur + batch_size - 1, end_h) + 1))
+            fut2 = executor.submit(_fetch_block_batch, heights, mode)
+            in_flight.append((heights[0], heights[-1], fut2))
+            cur = heights[-1] + 1
+
+        yield valid_pairs, blocks
 
 
 def batch_getrawtransactions(txids, verbose=True):
@@ -475,6 +527,66 @@ def ensure_tables_exist(conn):
         c.close()
 
 
+def _purge_from_height(conn, start_height: int):
+    """
+    Delete all rows at or after a given block height so we can safely rebuild
+    from that height without unique/duplicate conflicts. Also rebuilds 'spent'
+    flags from remaining vin rows to keep the DB consistent for earlier blocks.
+    """
+    if start_height is None or start_height < 1:
+        return
+    c = conn.cursor()
+    try:
+        # Make sure schema exists
+        ensure_tables_exist(conn)
+
+        # 1) vin deren EIGENE tx in zu löschenden Blöcken liegt
+        c.execute('''
+            DELETE FROM vin
+            WHERE txid IN (
+                SELECT t.txid
+                FROM transactions t
+                JOIN blocks b ON t.block_hash = b.block_hash
+                WHERE b.block_height >= ?
+            )
+        ''', (start_height,))
+        # 2) vout, die in den zu löschenden Blöcken erstellt wurden
+        c.execute('''
+            DELETE FROM vout
+            WHERE block_hash IN (
+                SELECT block_hash FROM blocks WHERE block_height >= ?
+            )
+        ''', (start_height,))
+        # 3) transactions der zu löschenden Blöcke
+        c.execute('''
+            DELETE FROM transactions
+            WHERE block_hash IN (
+                SELECT block_hash FROM blocks WHERE block_height >= ?
+            )
+        ''', (start_height,))
+        # 4) schließlich die Blöcke selbst
+        c.execute('DELETE FROM blocks WHERE block_height >= ?', (start_height,))
+
+        # Spent-Flags aus verbliebenen vin-Daten neu aufbauen
+        c.execute('UPDATE vout SET spent = 0')
+        c.execute('''
+            UPDATE vout
+            SET spent = 1
+            WHERE EXISTS (
+                SELECT 1 FROM vin
+                WHERE vin.vout_txid = vout.txid
+                  AND vin.vout_index = vout.ind
+            )
+        ''')
+
+        conn.commit()
+    except Exception as e:
+        print(f"Error purging from height {start_height}: {e}")
+        conn.rollback()
+    finally:
+        c.close()
+
+
 def replace_block_in_db(_block_info, current_height, conn):
     _block_hash = _block_info['hash']
     _block_size = int(_block_info.get('size', 0))
@@ -692,160 +804,234 @@ def rebuild_addresses(conn, current_block_height):
         c.close()
 
 
-def reindex_db():
-    reinitialize_tables()
+def reindex_db(start_height=None):
+    """
+    Full reindex when start_height is None (drop & recreate tables).
+    Partial reindex when start_height >= 1: purge data from that height and rebuild to tip.
+    """
+    if start_height is None:
+        # Original "full" reindex behaviour
+        reinitialize_tables()
+        conn = sqlite3.connect(DATABASE, timeout=10)
+        try:
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('PRAGMA synchronous=NORMAL')
+            conn.execute('PRAGMA temp_store=MEMORY')
+            conn.execute('PRAGMA cache_size=-20000')
+            conn.execute('PRAGMA foreign_keys=OFF')
+            conn.execute('PRAGMA busy_timeout=5000')
+
+            drop_indices(conn)
+
+            c = conn.cursor()
+            c.execute('SELECT MAX(block_height) FROM blocks')
+            result = c.fetchone()
+            last_saved_block_height = result[0] if result and result[0] is not None else 0
+            print(f"Last saved block height: {last_saved_block_height}")
+
+            current_block_height = int(getblockcount() or 0)
+            print(f"Current block height: {current_block_height}")
+
+            if current_block_height > last_saved_block_height:
+                print(f"Updating database with new blocks from {last_saved_block_height + 1} to {current_block_height}.")
+                start_h = last_saved_block_height + 1
+                end_h = current_block_height
+                idx = 0
+                h = start_h
+
+                mode = resolve_verbose_mode()
+                print(f"[index] getblock verbose mode: {mode}")
+
+                if not conn.in_transaction:
+                    conn.execute('BEGIN IMMEDIATE')
+
+                prefetch_pool = ThreadPoolExecutor(max_workers=PREFETCH_WORKERS)
+                try:
+                    for valid_pairs, blocks in _prefetch_pipeline_iter(h, end_h, mode, BATCH_SIZE, prefetch_pool, PREFETCH_DEPTH):
+                        if not valid_pairs:
+                            continue
+
+                        per_block_entries = []
+                        need_separate_tx_fetch = (mode == 'ids_only')
+                        all_txids = []
+
+                        for bi in blocks:
+                            if not bi:
+                                per_block_entries.append([])
+                                continue
+                            txs = bi.get('tx', [])
+                            if isinstance(txs, list) and txs and isinstance(txs[0], dict):
+                                per_block_entries.append(txs)
+                            else:
+                                per_block_entries.append(txs)
+                                if need_separate_tx_fetch:
+                                    all_txids.extend(txs)
+
+                        decoded_map = {}
+                        if need_separate_tx_fetch and all_txids:
+                            tx_results = batch_getrawtransactions_chunked(all_txids, verbose=True, chunk=TX_BATCH_CHUNK)
+                            for txid, t in zip(all_txids, tx_results):
+                                if t:
+                                    decoded_map[txid] = t
+
+                        block_iter = iter(blocks)
+                        for (height, hh), txs in zip(valid_pairs, per_block_entries):
+                            bi = next(block_iter, None)
+                            if not bi:
+                                print(f"Failed to get block for height {height}.")
+                                continue
+
+                            replace_block_in_db(bi, current_block_height, conn)
+                            time_epoch = _normalize_block_time(bi.get('time'))
+
+                            if txs:
+                                if isinstance(txs[0], dict):
+                                    for t in txs:
+                                        replace_transaction_in_db(t, height, hh, time_epoch, conn, do_address_updates=False)
+                                else:
+                                    for txid in txs:
+                                        t = decoded_map.get(txid)
+                                        if t is None:
+                                            t = getrawtransaction(txid, verbose=True)
+                                            if not t:
+                                                continue
+                                        replace_transaction_in_db(t, height, hh, time_epoch, conn, do_address_updates=False)
+
+                            idx += 1
+                            if idx % COMMIT_INTERVAL == 0:
+                                conn.commit()
+                                conn.execute('BEGIN IMMEDIATE')
+                                print(f"… up to block {height}")
+
+                        h = valid_pairs[-1][0] + 1
+                finally:
+                    prefetch_pool.shutdown(wait=True)
+
+                conn.commit()
+                create_indices(conn)
+                conn.commit()
+                rebuild_addresses(conn, current_block_height)
+            else:
+                print("No new blocks to add.")
+        except Exception as e:
+            print(f"Failed to update with latest blocks: {e}")
+            conn.rollback()
+        finally:
+            conn.close()
+        return
+
+    # ---- Partial reindex path (start_height provided) ----
+    start_h = max(1, int(start_height))
     conn = sqlite3.connect(DATABASE, timeout=10)
     try:
-        # Fast bulk settings (safe for offline reindex)
         conn.execute('PRAGMA journal_mode=WAL')
         conn.execute('PRAGMA synchronous=NORMAL')
         conn.execute('PRAGMA temp_store=MEMORY')
         conn.execute('PRAGMA cache_size=-20000')
         conn.execute('PRAGMA foreign_keys=OFF')
         conn.execute('PRAGMA busy_timeout=5000')
-        # no EXCLUSIVE locking; allow readers while we write in WAL mode
 
-        # Drop indices for fastest bulk insert; recreate at the end
-        drop_indices(conn)
-
-        c = conn.cursor()
-        c.execute('SELECT MAX(block_height) FROM blocks')
-        result = c.fetchone()
-        last_saved_block_height = result[0] if result and result[0] is not None else 0
-        print(f"Last saved block height: {last_saved_block_height}")
+        ensure_tables_exist(conn)
 
         current_block_height = int(getblockcount() or 0)
-        print(f"Current block height: {current_block_height}")
+        print(f"[partial reindex] Purging from height {start_h}, tip is {current_block_height}")
 
-        if current_block_height > last_saved_block_height:
-            print(f"Updating database with new blocks from {last_saved_block_height + 1} to {current_block_height}.")
-            # BATCH_SIZE is now only the global value
-            start_h = last_saved_block_height + 1
-            end_h = current_block_height
-            idx = 0
-            h = start_h
+        drop_indices(conn)
+        _purge_from_height(conn, start_h)
 
-            # Detect / resolve getblock verbose mode once
-            global GETBLOCK_VERBOSE_MODE
-            if GETBLOCK_VERBOSE in ("auto", ""):
-                GETBLOCK_VERBOSE_MODE = detect_getblock_verbose_mode()
-            else:
-                m = GETBLOCK_VERBOSE.strip().lower()
-                mapping = {"0": "ids_only", "false": "ids_only", "1": "txinfo", "true": "txinfo", "2": "txinfo_details"}
-                GETBLOCK_VERBOSE_MODE = mapping.get(m, "ids_only")
-            print(f"[index] getblock verbose mode: {GETBLOCK_VERBOSE_MODE}")
+        mode = resolve_verbose_mode()
+        print(f"[partial] getblock verbose mode: {mode}")
 
-            # Start first explicit transaction once
-            if not conn.in_transaction:
-                conn.execute('BEGIN IMMEDIATE')
-
-            # --- Prefetch pipeline: overlap RPC with DB writes ---
-            prefetch_pool = ThreadPoolExecutor(max_workers=1)
-            try:
-                # Prime the first future
-                first_heights = list(range(h, min(h + BATCH_SIZE - 1, end_h) + 1))
-                future = prefetch_pool.submit(_fetch_block_batch, first_heights, GETBLOCK_VERBOSE_MODE)
-
-                while True:
-                    # Wait for current batch
-                    try:
-                        valid_pairs, blocks = future.result()
-                    except Exception as e:
-                        print(f"Prefetch failed for heights {h}..{min(h + BATCH_SIZE - 1, end_h)}: {e}")
-                        valid_pairs, blocks = [], []
-
-                    if not valid_pairs:
-                        break  # nothing more to process
-
-                    # Schedule next batch if any
-                    next_start = valid_pairs[-1][0] + 1
-                    if next_start <= end_h:
-                        next_heights = list(range(next_start, min(next_start + BATCH_SIZE - 1, end_h) + 1))
-                        future = prefetch_pool.submit(_fetch_block_batch, next_heights, GETBLOCK_VERBOSE_MODE)
-                    else:
-                        future = None
-
-                    # Prepare per-block tx containers
-                    per_block_entries = []
-                    need_separate_tx_fetch = (GETBLOCK_VERBOSE_MODE == 'ids_only')
-                    all_txids = []
-
-                    for bi in blocks:
-                        if not bi:
-                            per_block_entries.append([])
-                            continue
-                        txs = bi.get('tx', [])
-                        if isinstance(txs, list) and txs and isinstance(txs[0], dict):
-                            per_block_entries.append(txs)
-                        else:
-                            per_block_entries.append(txs)
-                            if need_separate_tx_fetch:
-                                all_txids.extend(txs)
-
-                    decoded_map = {}
-                    if need_separate_tx_fetch and all_txids:
-                        tx_results = batch_getrawtransactions_chunked(all_txids, verbose=True, chunk=TX_BATCH_CHUNK)
-                        for txid, t in zip(all_txids, tx_results):
-                            if t:
-                                decoded_map[txid] = t
-
-                    # Apply in original height order
-                    block_iter = iter(blocks)
-                    for (height, hh), txs in zip(valid_pairs, per_block_entries):
-                        bi = next(block_iter, None)
-                        if not bi:
-                            print(f"Failed to get block for height {height}.")
-                            continue
-
-                        replace_block_in_db(bi, current_block_height, conn)
-                        time_epoch = _normalize_block_time(bi.get('time'))
-
-                        if txs:
-                            if isinstance(txs[0], dict):
-                                for t in txs:
-                                    replace_transaction_in_db(t, height, hh, time_epoch, conn, do_address_updates=False)
-                            else:
-                                for txid in txs:
-                                    t = decoded_map.get(txid)
-                                    if t is None:
-                                        t = getrawtransaction(txid, verbose=True)
-                                        if not t:
-                                            continue
-                                    replace_transaction_in_db(t, height, hh, time_epoch, conn, do_address_updates=False)
-
-                        idx += 1
-                        if idx % COMMIT_INTERVAL == 0:
-                            conn.commit()
-                            conn.execute('BEGIN IMMEDIATE')
-                            print(f"… up to block {height}")
-
-                    # Advance h to next_start or exit if done
-                    h = next_start
-                    if future is None:
-                        break
-            finally:
-                prefetch_pool.shutdown(wait=True)
-
-            # Final commit before post-processing
-            conn.commit()
-            # Recreate indices after bulk load to speed up subsequent queries
+        end_h = current_block_height
+        if start_h > end_h:
+            print("Start height is above current tip; nothing to do.")
             create_indices(conn)
             conn.commit()
-            # Bulk rebuild addresses (much faster than per-tx updates)
-            rebuild_addresses(conn, current_block_height)
-        else:
-            print("No new blocks to add.")
+            return
+
+        if not conn.in_transaction:
+            conn.execute('BEGIN IMMEDIATE')
+
+        prefetch_pool = ThreadPoolExecutor(max_workers=PREFETCH_WORKERS)
+        try:
+            idx = 0
+            h = start_h
+            for valid_pairs, blocks in _prefetch_pipeline_iter(h, end_h, mode, BATCH_SIZE, prefetch_pool, PREFETCH_DEPTH):
+                if not valid_pairs:
+                    continue
+
+                per_block_entries = []
+                need_separate_tx_fetch = (mode == 'ids_only')
+                all_txids = []
+
+                for bi in blocks:
+                    if not bi:
+                        per_block_entries.append([])
+                        continue
+                    txs = bi.get('tx', [])
+                    if isinstance(txs, list) and txs and isinstance(txs[0], dict):
+                        per_block_entries.append(txs)
+                    else:
+                        per_block_entries.append(txs)
+                        if need_separate_tx_fetch:
+                            all_txids.extend(txs)
+
+                decoded_map = {}
+                if need_separate_tx_fetch and all_txids:
+                    tx_results = batch_getrawtransactions_chunked(all_txids, verbose=True, chunk=TX_BATCH_CHUNK)
+                    for txid, t in zip(all_txids, tx_results):
+                        if t:
+                            decoded_map[txid] = t
+
+                block_iter = iter(blocks)
+                for (height, hh), txs in zip(valid_pairs, per_block_entries):
+                    bi = next(block_iter, None)
+                    if not bi:
+                        print(f"Failed to get block for height {height}.")
+                        continue
+
+                    replace_block_in_db(bi, current_block_height, conn)
+                    time_epoch = _normalize_block_time(bi.get('time'))
+
+                    if txs:
+                        if isinstance(txs[0], dict):
+                            for t in txs:
+                                replace_transaction_in_db(t, height, hh, time_epoch, conn, do_address_updates=False)
+                        else:
+                            for txid in txs:
+                                t = decoded_map.get(txid)
+                                if t is None:
+                                    t = getrawtransaction(txid, verbose=True)
+                                    if not t:
+                                        continue
+                                replace_transaction_in_db(t, height, hh, time_epoch, conn, do_address_updates=False)
+
+                    idx += 1
+                    if idx % COMMIT_INTERVAL == 0:
+                        conn.commit()
+                        conn.execute('BEGIN IMMEDIATE')
+                        print(f"… up to block {height}")
+
+                h = valid_pairs[-1][0] + 1
+        finally:
+            prefetch_pool.shutdown(wait=True)
+
+        conn.commit()
+        create_indices(conn)
+        conn.commit()
+        rebuild_addresses(conn, current_block_height)
     except Exception as e:
-        print(f"Failed to update with latest blocks: {e}")
+        print(f"Failed partial reindex from {start_h}: {e}")
         conn.rollback()
     finally:
         conn.close()
 
 
-def reindex_db_continue():
+def reindex_db_continue(rewind: int = CONTINUE_REWIND):
     """
-    Resume indexing from the last saved block height, without dropping tables.
-    Uses the same prefetch pipeline as reindex_db(), but keeps existing data and indices.
+    Resume indexing, but first rewind N blocks (default CONTINUE_REWIND=10) to
+    avoid inconsistencies if the last run was interrupted. This purges data
+    from the rewind start height so there are no duplicate key conflicts.
     """
     conn = sqlite3.connect(DATABASE, timeout=10)
     try:
@@ -868,50 +1054,29 @@ def reindex_db_continue():
         print(f"Current block height: {current_block_height}")
 
         if current_block_height > last_saved_block_height:
-            print(f"Continuing database update from {last_saved_block_height + 1} to {current_block_height}.")
-            start_h = last_saved_block_height + 1
+            start_h = max(1, last_saved_block_height - int(rewind))
             end_h = current_block_height
+            print(f"Continuing with rewind={rewind}: rebuilding from {start_h} to {end_h}.")
+
+            _purge_from_height(conn, start_h)
+
             idx = 0
             h = start_h
 
-
-            global GETBLOCK_VERBOSE_MODE
-            if GETBLOCK_VERBOSE in ("auto", ""):
-                GETBLOCK_VERBOSE_MODE = detect_getblock_verbose_mode()
-            else:
-                m = GETBLOCK_VERBOSE.strip().lower()
-                mapping = {"0": "ids_only", "false": "ids_only", "1": "txinfo", "true": "txinfo", "2": "txinfo_details"}
-                GETBLOCK_VERBOSE_MODE = mapping.get(m, "ids_only")
-            print(f"[continue] getblock verbose mode: {GETBLOCK_VERBOSE_MODE}")
-
+            mode = resolve_verbose_mode()
+            print(f"[continue] getblock verbose mode: {mode}")
 
             if not conn.in_transaction:
                 conn.execute('BEGIN IMMEDIATE')
 
-            prefetch_pool = ThreadPoolExecutor(max_workers=1)
+            prefetch_pool = ThreadPoolExecutor(max_workers=PREFETCH_WORKERS)
             try:
-                first_heights = list(range(h, min(h + BATCH_SIZE - 1, end_h) + 1))
-                future = prefetch_pool.submit(_fetch_block_batch, first_heights, GETBLOCK_VERBOSE_MODE)
-
-                while True:
-                    try:
-                        valid_pairs, blocks = future.result()
-                    except Exception as e:
-                        print(f"Prefetch failed for heights {h}..{min(h + BATCH_SIZE - 1, end_h)}: {e}")
-                        valid_pairs, blocks = [], []
-
+                for valid_pairs, blocks in _prefetch_pipeline_iter(h, end_h, mode, BATCH_SIZE, prefetch_pool, PREFETCH_DEPTH):
                     if not valid_pairs:
-                        break
-
-                    next_start = valid_pairs[-1][0] + 1
-                    if next_start <= end_h:
-                        next_heights = list(range(next_start, min(next_start + BATCH_SIZE - 1, end_h) + 1))
-                        future = prefetch_pool.submit(_fetch_block_batch, next_heights, GETBLOCK_VERBOSE_MODE)
-                    else:
-                        future = None
+                        continue
 
                     per_block_entries = []
-                    need_separate_tx_fetch = (GETBLOCK_VERBOSE_MODE == 'ids_only')
+                    need_separate_tx_fetch = (mode == 'ids_only')
                     all_txids = []
 
                     for bi in blocks:
@@ -962,14 +1127,11 @@ def reindex_db_continue():
                             conn.execute('BEGIN IMMEDIATE')
                             print(f"… up to block {height}")
 
-                    h = next_start
-                    if future is None:
-                        break
+                    h = valid_pairs[-1][0] + 1
             finally:
                 prefetch_pool.shutdown(wait=True)
 
             conn.commit()
-
             rebuild_addresses(conn, current_block_height)
         else:
             print("No new blocks to add.")
@@ -978,6 +1140,7 @@ def reindex_db_continue():
         conn.rollback()
     finally:
         conn.close()
+
 
 def update_with_latest_block():
     with sqlite3.connect(DATABASE, timeout=5) as conn:
