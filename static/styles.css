@@ -1,0 +1,364 @@
+html, body {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    font-family: 'Helvetica Neue', Arial, sans-serif;
+    display: flex;
+    color: white;
+    flex-direction: column;
+    /* background: #f9f9f9; */
+    background: #4d0f13;
+}
+
+body:not(.frame-center) .header {
+    background-color: #4d0f13;
+    padding: 20px 0px;
+    text-align: center;
+    font-size: 18px;
+    color: white;
+    font-weight: bold;
+    margin-left: 160px;
+}
+
+/* Search bar in the top header (app shell only, not frames) */
+body:not(.frame-center) .header form {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 12px;
+    margin: 0 auto;
+    padding: 0 20px;
+    width: 100%;
+    max-width: none;        /* let it span full header width */
+    flex-wrap: wrap;        /* allow wrapping on small screens */
+    box-sizing: border-box;
+}
+body:not(.frame-center) .header input[type="text"] {
+    flex: 1 1 480px;        /* grow to fill available space */
+    max-width: none;
+    padding: 10px 20px;
+    font-size: 16px;
+    border: 2px solid #ccc;
+    position: static;       /* stay in normal flow */
+    border-radius: 4px;
+    box-sizing: border-box;
+}
+body:not(.frame-center) .header button {
+    flex: 0 0 auto;
+    white-space: nowrap;
+}
+
+button {
+    padding: 12px 24px;
+    font-size: 16px;
+    background-color: #ffc900;
+    color: black;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+button:hover {
+    background-color: #f1f1f1;
+}
+
+body:not(.frame-center) .sidebar {
+    background-color: black;
+    box-shadow: 0 0 10px rgba(0,0,0,0.1);
+    padding: 20px;
+    position: fixed;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 120px;
+    overflow-y: auto;
+}
+body:not(.frame-center) .sidebar img {
+    width: 100%;
+    margin-bottom: 20px;
+}
+body:not(.frame-center) .sidebar button {
+    display: block;
+    width: 100%;
+    padding: 10px;
+    color: white;
+    background: transparent;
+    border: none;
+    text-align: left;
+    cursor: pointer;
+    font-size: 16px;
+    margin-bottom: 10px;
+}
+body:not(.frame-center) .sidebar button:hover {
+    background-color: #ffc900;
+}
+
+body:not(.frame-center) .blockchain-stats {
+    margin-left: 160px;
+    flex: 1;
+    color: white;
+    background: #4d0f13;
+    padding: 10px;
+}
+
+body:not(.frame-center) .blockchain-stats iframe {
+    width: 100%;
+    height: 200px;
+    border: none;
+}
+
+body:not(.frame-center) .main-content {
+    margin-left: 160px;
+    flex: 3;
+    padding: 20px;
+    overflow: auto;
+}
+
+iframe {
+    width: 100%;
+    height: 100%;
+    border: none;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 20px;
+    background-color: white;
+    color: black;
+}
+
+th, td {
+    border: 1px solid #ddd;
+    padding: 8px;
+    text-align: left;
+}
+
+th {
+    background-color: #ffc900;
+    color: #4d0f13;
+}
+
+
+tr:hover {
+    background-color: #f1f1f1;
+}
+
+h2 {
+    color: white;
+}
+
+.received {
+    background-color: #eaffea;
+}
+
+.sent {
+    background-color: #ffecec;
+}
+
+a, a:visited, a:hover, a:active {
+    color: #4d0f13;
+    text-decoration: none;
+}
+
+a:hover {
+    text-decoration: underline;
+}
+
+.pagination {
+    text-align: center;
+    margin-top: 20px;
+    color: #ffc900;
+}
+
+.pagination a {
+    color: white;
+    text-decoration: none;
+}
+
+/* === Shared Card + Frame Styles (used by blockchain_stats.html and consensus_stats.html) === */
+:root {
+    --bg: #4d0f13;
+    --card: #ffffff;
+    --accent: #ffc900;
+    --text: #333;
+}
+/* Centered frame body helper */
+body.frame-center {
+    background: var(--bg);
+    color: var(--text);
+    padding: 20px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 10vh;
+    font-family: 'Helvetica Neue', Arial, sans-serif;
+}
+/* Grid wrapper for 3 cards centered */
+.wrap {
+    padding: 18px;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(280px, 1fr));
+    gap: 16px; /* spacing between cards */
+    align-items: stretch;
+    width: min(1100px, 100%);
+    margin: 0 auto; /* center the grid container */
+    justify-content: center; /* center tracks if extra space */
+}
+@media (max-width: 992px) {
+    .wrap {
+        grid-template-columns: repeat(2, minmax(280px, 1fr));
+        width: min(740px, 100%);
+    }
+}
+@media (max-width: 600px) {
+    .wrap {
+        grid-template-columns: 1fr;
+        width: 100%;
+    }
+}
+
+/* Wide grid variant: use all available width */
+.wrap--wide {
+    width: 100%;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+}
+/* Short card helper for small stat tiles */
+.card--short {
+    min-height: 120px;
+}
+
+/* Card base */
+.card {
+    background: var(--card);
+    border-radius: 10px;
+    box-shadow: 0 4px 8px rgba(0,0,0,.1);
+    display: flex;
+    padding: 20px;       /* inner padding like the small stat cards */
+    margin: 0;           /* spacing handled by grid gap */
+    flex-direction: column;
+    min-height: 200px;
+    text-align: center;
+    color: var(--text);
+}
+/* Card header (avoid conflict with .header used by the main layout) */
+.card-header {
+    background: var(--accent);
+    color: #4d0f13;
+    padding: 10px 12px;
+    border-radius: 12px !important;   /* pill shape inside the card */
+    font-size: 18px;
+    font-weight: 700;
+    display: flex;
+    flex-direction: column;     /* allow optional subtitle */
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    gap: 4px;
+    width: 100%;                /* equal width across cards */
+    box-sizing: border-box;
+}
+.card-header .title {
+    font-size: 20px;
+    font-weight: 800;
+}
+.card-header .subtitle {
+    font-size: 13px;
+    font-weight: 600;
+}
+/* Card content */
+.card-content {
+    padding: 18px 20px;
+    font-size: 16px;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 6px;
+}
+.card-content strong {
+    color: #4d0f13;
+}
+/* KPI and Meta blocks */
+.kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+}
+.kpi {
+    background: #ffc900;
+    border: 1px solid #eee;
+    border-radius: 8px;
+    padding: 14px 10px;
+    text-align: center;
+}
+.kpi span {
+    display: block;
+    font-size: 13px;
+    color: #666;
+    margin-bottom: 6px;
+}
+.kpi strong { font-size: 18px; }
+.meta-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 10px;
+}
+.stat {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: #ffc900;
+    border: 1px solid #eee;
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 14px;
+}
+.legend {
+    margin-top: 10px;
+    font-size: 14px;
+    text-align: center;
+}
+.legend .dot {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    margin-right: 6px;
+    vertical-align: baseline;
+}
+/* Square chart container to keep the pie perfectly round */
+.chart-box {
+    position: relative;
+    width: 100%;
+    margin: 4px auto 0;
+}
+.chart-square {
+    aspect-ratio: 1 / 1;   /* enforce a square */
+    max-width: 520px;      /* cap size */
+}
+.chart-box canvas {
+    position: absolute;
+    inset: 0;
+    width: 100% !important;
+    height: 100% !important;
+}
+@media (max-width: 480px) {
+    .kpi-grid { grid-template-columns: 1fr; }
+    .chart-square { max-width: 100%; }
+}
+
+/* Ensure card headers inside frame pages render consistently */
+body.frame-center .wrap .card > .card-header {
+    background: var(--accent) !important;
+    color: #4d0f13 !important;
+    border-radius: 12px !important;
+    width: 100% !important;
+    display: flex !important;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    padding: 10px 12px;
+    gap: 4px;
+}

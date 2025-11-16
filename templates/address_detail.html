@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <title>Address Details</title>
+</head>
+<body>
+<div class="container">
+    <h3>Address: {{ address }}</h3>
+    <p><strong>Total Received:</strong> {{ address_details.total_received }}</p>
+    <p><strong>Total Sent:</strong> {{ address_details.total_sent }}</p>
+    <p><strong>Total Balance:</strong> {{ address_details.balance }}</p>
+
+    <h4>Transactions</h4>
+    <table>
+        <tr>
+            <th>Transaction ID</th>
+            <th>Type</th>
+            <th>Amount (SLM)</th>
+            <th>Date and Time</th>
+        </tr>
+        {% for transaction in transactions %}
+        <tr class="{{ 'received' if transaction.type == 'received' else 'sent' }}">
+            <td><a href="{{ url_for('transaction_detail', txid=transaction.txid) }}">{{ transaction.txid }}</a></td>
+            <td>{{ transaction.type }}</td>
+            <td>{{ transaction.amount }}</td>
+            <td>{{ transaction.timestamp }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    {% if total_pages > 1 %}
+    <div class="pagination">
+        {% if page > 1 %}
+        <a href="{{ url_for('address_detail', address=address, page=page-1) }}">Previous</a>
+        {% endif %}
+        {% for num in pages %}
+            {% if num == page %}
+                <strong>{{ num }}</strong>
+            {% else %}
+                <a href="{{ url_for('address_detail', address=address, page=num) }}">{{ num }}</a>
+            {% endif %}
+        {% endfor %}
+        {% if page < total_pages %}
+        <a href="{{ url_for('address_detail', address=address, page=page+1) }}">Next</a>
+        {% endif %}
+    </div>
+    {% endif %}
+</div>
+</body>
+</html>

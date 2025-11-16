@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <title>Block Details</title>
+</head>
+<body>
+<div class="container">
+    <h3>Block: {{ block.block_hash }}</h3>
+    <p><strong>Block Height: {{ block.block_height }}</strong></p>
+    <table>
+        <tr>
+            <th>Transaction ID</th>
+            <th>Amount</th>
+        </tr>
+        {% for tx in block.transactions %}
+        <tr>
+            <td><a href="{{ url_for('transaction_detail', txid=tx.txid) }}">{{ tx.txid }}</a></td>
+            <td>{{ tx.amount }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+</div>
+</body>
+</html>

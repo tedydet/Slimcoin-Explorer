@@ -1,0 +1,33 @@
+# Default ignored files
+/shelf/
+/workspace.xml
+*.crt
+
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual env
+.venv/
+venv/
+
+# IDE
+.idea/
+*.iml
+
+# OS
+.DS_Store
+
+# Local data / secrets
+.env
+*.db
+*.sqlite
+blockchain.db
+peers.db
+
+# Logs
+*.log

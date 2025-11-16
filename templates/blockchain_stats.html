@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="refresh" content="60">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <title>Blockchain Stats</title>
+</head>
+<body class="frame-center">
+<div class="wrap" style="grid-template-columns: repeat(3, 250px); width:auto;">
+    <div class="card" style="min-height: 120px;">
+        <div class="card-header">Circulating Supply</div>
+        <div class="card-content"><strong>{{ total_supply }} SLM</strong></div>
+    </div>
+    <div class="card" style="min-height: 120px;">
+        <div class="card-header">Current Difficulty</div>
+        <div class="card-content"><strong>{{ current_difficulty }}</strong></div>
+    </div>
+    <div class="card" style="min-height: 120px;">
+        <div class="card-header">Hash Rate</div>
+        <div class="card-content"><strong>{{ hash_rate }} kH/s</strong></div>
+    </div>
+</div>
+</body>
+</html>

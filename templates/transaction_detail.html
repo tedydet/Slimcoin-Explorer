@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <title>Transaction Details</title>
+</head>
+<body>
+<div class="container">
+    <h3>Transaction: {{ transaction.txid }}</h3>
+    <p><strong>Block Hash:</strong> {{ transaction.block_hash }}</p>
+    <p><strong>Confirmations:</strong> {{ transaction.confirmations }}</p>
+    <p><strong>Timestamp:</strong> {{ transaction.timestamp }}</p>
+    <p><strong>Amount:</strong> {{ transaction.amount }}</p>
+    <p><strong>Is Block Reward:</strong> {{ mining_status }}</p>
+    {% if mining_status == "Yes" %}
+    <p><strong>Reward Type:</strong>
+      {% if reward_flag %}
+        {% if reward_flag == 'proof-of-work' %}PoW
+        {% elif reward_flag == 'proof-of-stake' %}PoS
+        {% elif reward_flag == 'proof-of-burn' %}PoB
+        {% else %}{{ reward_flag }}
+        {% endif %}
+      {% else %}unknown
+      {% endif %}
+    </p>
+    {% if reward_flag == 'proof-of-burn' and effective_burn_coins is not none %}
+    <p><strong>Effective Burn Coins:</strong> {{ effective_burn_coins }}</p>
+    {% endif %}
+    {% endif %}
+
+    <h4>Inputs</h4>
+    <table>
+        <tr>
+            <th>Sender Address</th>
+            <th>Amount</th>
+        </tr>
+        {% if mining_status == "Yes" %}
+        <tr>
+            <td>
+              Coinbase (
+              {{ 'PoW' if reward_flag == 'proof-of-work' else
+                 'PoS' if reward_flag == 'proof-of-stake' else
+                 'PoB' if reward_flag == 'proof-of-burn' else
+                 'Mining Reward' }})
+            </td>
+            <td>{{ transaction.amount }}</td>
+        </tr>
+        {% else %}
+        {% for input in inputs %}
+        <tr>
+            <td><a href="{{ url_for('address_detail', address=input.sender) }}">{{ input.sender }}</a></td>
+            <td>{{ input.amount }}</td>
+        </tr>
+        {% endfor %}
+        {% endif %}
+    </table>
+
+    <h4>Outputs</h4>
+    <table>
+        <tr>
+            <th>Recipient Address</th>
+            <th>Amount</th>
+        </tr>
+        {% for output in outputs %}
+        <tr>
+            <td><a href="{{ url_for('address_detail', address=output.recipient) }}">{{ output.recipient }}</a></td>
+            <td>{{ output.amount }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+</div>
+</body>
+</html>

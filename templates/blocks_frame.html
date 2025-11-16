@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="refresh" content="60">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <title>Blocks Frame</title>
+</head>
+<body>
+    <table>
+        <tr>
+            <th>Index</th>
+            <th>Block Hash</th>
+            <th>Amount</th>
+            <th>Date and Time</th>
+        </tr>
+        {% for block in blocks %}
+        <tr>
+            <td>{{ block['block_height'] }}</td>
+            <td><a href="{{ url_for('block_detail', block_hash=block['block_hash']) }}" target="contentFrame">{{ block['block_hash'] }}</a></td>
+            <td>{{ block['total_amount'] }}</td>
+            <td>{{ block['timestamp'] }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    <div class="pagination">
+        {% if page > 1 %}
+        <a href="{{ url_for('blocks_frame', page=1) }}">First</a>
+        <a href="{{ url_for('blocks_frame', page=page-1) }}">Previous</a>
+        {% endif %}
+        {% for num in pages %}
+            {% if num == page %}
+                <strong>{{ num }}</strong>
+            {% else %}
+                <a href="{{ url_for('blocks_frame', page=num) }}">{{ num }}</a>
+            {% endif %}
+        {% endfor %}
+        {% if page < total_pages %}
+        <a href="{{ url_for('blocks_frame', page=page+1) }}">Next</a>
+        <a href="{{ url_for('blocks_frame', page=total_pages) }}">Last</a>
+        {% endif %}
+    </div>
+</body>
+</html>
+

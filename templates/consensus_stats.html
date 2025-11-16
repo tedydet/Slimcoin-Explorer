@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <title>Consensus Stats</title>
+</head>
+<body class="frame-center">
+    <div class="wrap">
+        <div class="card">
+            <div class="card-header">
+                <div class="title">Consensus Overview</div>
+                <div class="subtitle">last {{ consensus_window }} blocks</div>
+            </div>
+            <div class="card-content">
+                <div class="chart-box chart-square">
+                    <canvas id="consensusPie"></canvas>
+                </div>
+                <div class="legend">
+                    <span class="dot" style="background:#7a7a7a"></span>PoW: <strong>{{ pow_pct }}%</strong>
+                    &nbsp;&nbsp; <span class="dot" style="background:#2faa61"></span>PoS: <strong>{{ pos_pct }}%</strong>
+                    &nbsp;&nbsp; <span class="dot" style="background:#f39c12"></span>PoB: <strong>{{ pob_pct }}%</strong>
+                    {% if other_pct and other_pct > 0 %}
+                    &nbsp;&nbsp; <span class="dot" style="background:#cccccc"></span>Other: <strong>{{ other_pct }}%</strong>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header">
+                <div class="title">Average Block Rewards (SLM)</div>
+                <div class="subtitle">last {{ consensus_window }} blocks</div>
+            </div>
+            <div class="card-content">
+                <div class="kpi-grid">
+                    <div class="kpi">
+                        <span>PoW</span>
+                        <strong>{{ pow_avg_reward if pow_avg_reward is not none else '—' }}</strong>
+                    </div>
+                    <div class="kpi">
+                        <span>PoS</span>
+                        <strong>{{ pos_avg_reward if pos_avg_reward is not none else '—' }}</strong>
+                    </div>
+                    <div class="kpi">
+                        <span>PoB</span>
+                        <strong>{{ pob_avg_reward if pob_avg_reward is not none else '—' }}</strong>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header">Network Meta</div>
+            <div class="card-content">
+                <div class="meta-grid">
+                    <div class="stat"><span>Total Supply</span><strong>{{ total_supply }} SLM</strong></div>
+                    <div class="stat"><span>Current Difficulty</span><strong>{{ current_difficulty }}</strong></div>
+                    <div class="stat"><span>Hash Rate</span><strong>{{ hash_rate }} H/s</strong></div>
+                    <div class="stat"><span>Total burned</span><strong>{{ total_burnt }} SLM</strong></div>
+                    <div class="stat"><span>Minted SLM burnt</span><strong>{{ percentage_burnt }} %</strong></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script>
+        (function () {
+            const data = {
+                labels: ['PoW', 'PoS', 'PoB' {% if other_pct and other_pct > 0 %}, 'Other'{% endif %}],
+                datasets: [{
+                    data: [{{ pow_pct }}, {{ pos_pct }}, {{ pob_pct }}{% if other_pct and other_pct > 0 %}, {{ other_pct }}{% endif %}],
+                    backgroundColor: ['#7a7a7a', '#2faa61', '#f39c12' {% if other_pct and other_pct > 0 %}, '#cccccc'{% endif %}],
+                    borderColor: '#ffffff',
+                    borderWidth: 2
+                }]
+            };
+            const ctx = document.getElementById('consensusPie').getContext('2d');
+            new Chart(ctx, {
+                type: 'pie',
+                data,
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            callbacks: {
+                                label: (ctx) => `${ctx.label}: ${ctx.parsed}%`
+                            }
+                        }
+                    }
+                }
+            });
+        })();
+    </script>
+</body>
+</html>

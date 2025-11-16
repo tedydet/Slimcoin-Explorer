@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <title>Rich List</title>
+</head>
+<body>
+    <h2>Top 100 Wallets</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>Rank</th>
+                <th>Address</th>
+                <th>Total Amount (SLM)</th>
+                <th>Percentage of Total Supply</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for wallet in wallets %}
+            <tr>
+                <td>{{ loop.index }}</td>
+                <td><a href="{{ url_for('address_detail', address=wallet['address']) }}" target="contentFrame">{{ wallet['address'] }}</a></td>
+                <td>{{ wallet['total_amount'] }}</td>
+                <td>{{ wallet['percentage'] | round(2) }}%</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</body>
+</html>
