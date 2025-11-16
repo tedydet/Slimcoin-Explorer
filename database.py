@@ -5,10 +5,16 @@ from dotenv import load_dotenv
 import os
 from decimal import Decimal
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 
 # Reusable HTTP session for RPC calls
+from requests.adapters import HTTPAdapter
+
 _session = requests.Session()
-_session.headers.update({'content-type': 'application/json'})
+_session.headers.update({'content-type': 'application/json', 'Connection': 'keep-alive'})
+# Increase connection pools to better reuse TCP sessions during batching
+_session.mount('http://', HTTPAdapter(pool_connections=64, pool_maxsize=64, max_retries=0))
+_session.mount('https://', HTTPAdapter(pool_connections=64, pool_maxsize=64, max_retries=0))
 
 
 def _normalize_block_time(t):
@@ -32,10 +38,17 @@ rpc_password = os.getenv("RPC_PASSWORD")
 rpc_host = os.getenv("RPC_HOST")
 rpc_port = os.getenv("RPC_PORT")
 rpc_prefix = os.getenv("RPC_PREFIX")
-BATCH_SIZE = int(os.getenv("INDEX_BATCH_SIZE", "50"))
+
+BATCH_SIZE = int(os.getenv("INDEX_BATCH_SIZE", "100"))
+# Configurable commit interval and TX batch chunk size
+COMMIT_INTERVAL = int(os.getenv("INDEX_COMMIT_INTERVAL", "100"))
+TX_BATCH_CHUNK = int(os.getenv("TX_BATCH_CHUNK", "200"))
+GETBLOCK_VERBOSE = os.getenv("GETBLOCK_VERBOSE", "auto").lower()  # "auto", "0", "1", "2"
+GETBLOCK_VERBOSE_MODE = None  # resolved to: 'ids_only' | 'txinfo' | 'txinfo_details'
 
 DATABASE = 'blockchain.db'
 PEERS = 'peers.db'
+LOCK_FILE = '.reindex.lock'
 
 
 def rpc_request(method, params=None):
@@ -118,6 +131,78 @@ def batch_getblocks(hashes):
             out.append(item.get("result"))
     return out
 
+# --- getblock verbose auto helpers ---
+def _block_has_decoded_txs(block_obj: dict) -> bool:
+    if not isinstance(block_obj, dict):
+        return False
+    txs = block_obj.get('tx')
+    return isinstance(txs, list) and len(txs) > 0 and isinstance(txs[0], dict) and 'vin' in txs[0] and 'vout' in txs[0]
+
+def detect_getblock_verbose_mode():
+    """
+    Probes the node to detect whether getblock can return decoded tx objects.
+    Returns one of: 'ids_only', 'txinfo', 'txinfo_details'
+    """
+    try:
+        tip = int(getblockcount() or 0)
+        probe_h = max(1, tip // 2)
+        h = get_block_hash(probe_h) or get_block_hash(1)
+        if not h:
+            return 'ids_only'
+
+        r1 = rpc_request('getblock', [h, True])
+        if r1.get('error') is None and isinstance(r1.get('result'), dict):
+            if _block_has_decoded_txs(r1['result']):
+                return 'txinfo'
+
+        r2 = rpc_request('getblock', [h, True, True])
+        if r2.get('error') is None and isinstance(r2.get('result'), dict):
+            if _block_has_decoded_txs(r2['result']):
+                return 'txinfo_details'
+    except Exception:
+        pass
+    return 'ids_only'
+
+def batch_getblocks_verbose_auto(hashes, mode: str):
+    """
+    Batch getblock with verbosity based on detected 'mode'.
+    mode: 'ids_only'        => getblock(hash)
+          'txinfo'          => getblock(hash, True)
+          'txinfo_details'  => getblock(hash, True, True)
+    Returns a list of block objects (or None on failure) in the same order as 'hashes'.
+    """
+    if mode == 'txinfo_details':
+        calls = [("getblock", [h, True, True]) for h in hashes]
+    elif mode == 'txinfo':
+        calls = [("getblock", [h, True]) for h in hashes]
+    else:
+        calls = [("getblock", [h]) for h in hashes]
+    results = rpc_batch(calls)
+    out = []
+    for item in results:
+        if not item or item.get("error"):
+            out.append(None)
+        else:
+            out.append(item.get("result"))
+    return out
+
+
+# --- Prefetch pipeline helpers ---
+def _fetch_block_batch(heights, mode):
+    """
+    Fetch a contiguous batch of blocks:
+    - getblockhash for heights
+    - getblock (auto-verbose) for valid hashes
+    Returns (valid_pairs, blocks) where:
+      valid_pairs = [(height, block_hash), ...] only for hashes that resolved
+      blocks      = list of block objects aligned to valid_pairs order
+    """
+    hashes = batch_getblockhashes(heights)
+    valid_pairs = [(h, hh) for h, hh in zip(heights, hashes) if hh]
+    hash_list = [hh for _, hh in valid_pairs]
+    blocks = batch_getblocks_verbose_auto(hash_list, mode) if hash_list else []
+    return valid_pairs, blocks
+
 def batch_getrawtransactions(txids, verbose=True):
     if verbose:
         calls = [("getrawtransaction", [txid, 1]) for txid in txids]
@@ -131,6 +216,19 @@ def batch_getrawtransactions(txids, verbose=True):
         else:
             out.append(item.get("result"))
     return out
+
+# Helper: fetch raw transactions in chunks to avoid overloading node
+def batch_getrawtransactions_chunked(txids, verbose=True, chunk=TX_BATCH_CHUNK):
+    """
+    Fetch decoded transactions in chunks to avoid overloading the node.
+    Returns a list of results in the same order as txids (None for failures).
+    """
+    results = []
+    for i in range(0, len(txids), max(1, chunk)):
+        part = txids[i:i+chunk]
+        part_res = batch_getrawtransactions(part, verbose=verbose)
+        results.extend(part_res)
+    return results
 
 
 def getblockcount():
@@ -187,7 +285,7 @@ def decoderawtransaction(_hex):
 
 
 def reinitialize_tables():
-    conn = sqlite3.connect(DATABASE)
+    conn = sqlite3.connect(DATABASE, timeout=10)
     c = conn.cursor()
 
     # List of tables to be deleted and newly created
@@ -314,7 +412,7 @@ def replace_block_in_db(_block_info, current_height, conn):
 def update_peers():
     # Connect to database
     getpeerinfo = get_peers()
-    conn = sqlite3.connect(PEERS)
+    conn = sqlite3.connect(PEERS, timeout=5)
     c = conn.cursor()
 
     # Create Table in case it doesn't exist.
@@ -374,7 +472,7 @@ def update_address_in_db(address, received, sent, current_block_height, conn):
 
 
 def update_all_addresses(current_block_height):
-    with sqlite3.connect(DATABASE) as conn:
+    with sqlite3.connect(DATABASE, timeout=5) as conn:
         c = conn.cursor()
         try:
             # Call all addresses
@@ -412,7 +510,7 @@ def update_all_addresses(current_block_height):
             c.close()
 
 
-def replace_transaction_in_db(tx, block_height, block_hash, time, conn):
+def replace_transaction_in_db(tx, block_height, block_hash, time, conn, do_address_updates=True):
     c = conn.cursor()
     try:
         if 'txid' not in tx:
@@ -442,7 +540,8 @@ def replace_transaction_in_db(tx, block_height, block_hash, time, conn):
                 INSERT INTO vout (txid, ind, amount, address, spent, block_hash, created_block_height)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             ''', (tx['txid'], vout.get('n', 0), amount, address, False, block_hash, block_height))
-            update_address_in_db(address, amount, 0, block_height, conn)
+            if do_address_updates:
+                update_address_in_db(address, amount, 0, block_height, conn)
 
         # vin: spend & debit
         for vin in tx.get('vin', []):
@@ -458,22 +557,69 @@ def replace_transaction_in_db(tx, block_height, block_hash, time, conn):
             c.execute('SELECT address, amount FROM vout WHERE txid = ? AND ind = ?', (vout_txid, vout_index))
             vout_details = c.fetchone()
             if vout_details:
-                update_address_in_db(vout_details[0], 0, vout_details[1], block_height, conn)
+                if do_address_updates:
+                    update_address_in_db(vout_details[0], 0, vout_details[1], block_height, conn)
     except Exception as e:
         print(f"Failed to insert transaction data into database: {e}")
+    finally:
+        c.close()
+
+def rebuild_addresses(conn, current_block_height):
+    """
+    Recompute addresses in bulk from vout only (fast path for reindex):
+      - total_received: SUM(vout.amount) per address
+      - balance: SUM(vout.amount WHERE spent=0) per address
+      - total_sent: total_received - balance
+    This avoids per-transaction address updates during reindex.
+    """
+    c = conn.cursor()
+    try:
+        # Clear addresses and rebuild from aggregates
+        c.execute('DELETE FROM addresses')
+        c.execute('''
+            INSERT INTO addresses (address, total_received, total_sent, balance, last_updated)
+            SELECT r.address,
+                   r.total_received,
+                   r.total_received - IFNULL(u.balance, 0) AS total_sent,
+                   IFNULL(u.balance, 0) AS balance,
+                   ?
+            FROM (
+                SELECT address, SUM(amount) AS total_received
+                FROM vout
+                GROUP BY address
+            ) AS r
+            LEFT JOIN (
+                SELECT address, SUM(amount) AS balance
+                FROM vout
+                WHERE spent = 0
+                GROUP BY address
+            ) AS u ON r.address = u.address
+        ''', (current_block_height,))
+        conn.commit()
+    except Exception as e:
+        print(f"Error rebuilding addresses: {e}")
+        conn.rollback()
     finally:
         c.close()
 
 
 def reindex_db():
     reinitialize_tables()
-    conn = sqlite3.connect(DATABASE)
+    conn = sqlite3.connect(DATABASE, timeout=10)
     try:
+        # Create simple lock so other updaters can back off
+        try:
+            open(LOCK_FILE, 'w').close()
+        except Exception:
+            pass
         # Fast bulk settings (safe for offline reindex)
         conn.execute('PRAGMA journal_mode=WAL')
-        conn.execute('PRAGMA synchronous=OFF')
+        conn.execute('PRAGMA synchronous=NORMAL')
         conn.execute('PRAGMA temp_store=MEMORY')
         conn.execute('PRAGMA cache_size=-20000')
+        conn.execute('PRAGMA foreign_keys=OFF')
+        conn.execute('PRAGMA busy_timeout=5000')
+        # no EXCLUSIVE locking; allow readers while we write in WAL mode
 
         # Drop indices for fastest bulk insert; recreate at the end
         drop_indices(conn)
@@ -494,75 +640,135 @@ def reindex_db():
             end_h = current_block_height
             idx = 0
             h = start_h
+
+            # Detect / resolve getblock verbose mode once
+            global GETBLOCK_VERBOSE_MODE
+            if GETBLOCK_VERBOSE in ("auto", ""):
+                GETBLOCK_VERBOSE_MODE = detect_getblock_verbose_mode()
+            else:
+                m = GETBLOCK_VERBOSE.strip().lower()
+                mapping = {"0": "ids_only", "false": "ids_only", "1": "txinfo", "true": "txinfo", "2": "txinfo_details"}
+                GETBLOCK_VERBOSE_MODE = mapping.get(m, "ids_only")
+            print(f"[index] getblock verbose mode: {GETBLOCK_VERBOSE_MODE}")
+
             # Start first explicit transaction once
             if not conn.in_transaction:
-                conn.execute('BEGIN')
-            while h <= end_h:
-                # Build height batch
-                heights = list(range(h, min(h + BATCH_SIZE - 1, end_h) + 1))
-                # 1) getblockhash in batch
-                hashes = batch_getblockhashes(heights)
+                conn.execute('BEGIN IMMEDIATE')
 
-                # 2)keep valid pairs
-                valid_pairs = [(height, hh) for height, hh in zip(heights, hashes) if hh]
+            # --- Prefetch pipeline: overlap RPC with DB writes ---
+            prefetch_pool = ThreadPoolExecutor(max_workers=1)
+            try:
+                # Prime the first future
+                first_heights = list(range(h, min(h + BATCH_SIZE - 1, end_h) + 1))
+                future = prefetch_pool.submit(_fetch_block_batch, first_heights, GETBLOCK_VERBOSE_MODE)
 
-                # 3) getblock in batch using exact order from valid pairs
-                blocks = batch_getblocks([hh for _, hh in valid_pairs])
-                if not blocks:
-                    print(f"Batch getblock failed for heights {heights[0]}..{heights[-1]}")
-                    h += BATCH_SIZE
-                    continue
-                block_iter = iter(blocks)
+                while True:
+                    # Wait for current batch
+                    try:
+                        valid_pairs, blocks = future.result()
+                    except Exception as e:
+                        print(f"Prefetch failed for heights {h}..{min(h + BATCH_SIZE - 1, end_h)}: {e}")
+                        valid_pairs, blocks = [], []
 
-                # 4) Now run through heights again in the original order.
-                for height, hh in zip(heights, hashes):
-                    if not hh:
-                        print(f"Failed to get block hash for height {height}.")
-                        continue
-                    bi = next(block_iter, None)
-                    if not bi:
-                        print(f"Failed to get block for height {height}.")
-                        continue
+                    if not valid_pairs:
+                        break  # nothing more to process
 
-                    replace_block_in_db(bi, current_block_height, conn)
-                    time_epoch = _normalize_block_time(bi.get('time'))
+                    # Schedule next batch if any
+                    next_start = valid_pairs[-1][0] + 1
+                    if next_start <= end_h:
+                        next_heights = list(range(next_start, min(next_start + BATCH_SIZE - 1, end_h) + 1))
+                        future = prefetch_pool.submit(_fetch_block_batch, next_heights, GETBLOCK_VERBOSE_MODE)
+                    else:
+                        future = None
 
-                    txids = bi.get('tx', [])
-                    if txids:
-                        txs = batch_getrawtransactions(txids, verbose=True)
-                        for t, txid in zip(txs, txids):
-                            if not t:
-                                t = getrawtransaction(txid, verbose=True)
-                                if not t:
-                                    continue
-                            replace_transaction_in_db(t, height, hh, time_epoch, conn)
+                    # Prepare per-block tx containers
+                    per_block_entries = []
+                    need_separate_tx_fetch = (GETBLOCK_VERBOSE_MODE == 'ids_only')
+                    all_txids = []
 
-                    idx += 1
-                    if idx % 100 == 0:
-                        conn.commit()
-                        conn.execute('BEGIN')
-                        print(f"… up to block {height}")
+                    for bi in blocks:
+                        if not bi:
+                            per_block_entries.append([])
+                            continue
+                        txs = bi.get('tx', [])
+                        if isinstance(txs, list) and txs and isinstance(txs[0], dict):
+                            per_block_entries.append(txs)
+                        else:
+                            per_block_entries.append(txs)
+                            if need_separate_tx_fetch:
+                                all_txids.extend(txs)
 
-                # advance to next batch
-                h += BATCH_SIZE
+                    decoded_map = {}
+                    if need_separate_tx_fetch and all_txids:
+                        tx_results = batch_getrawtransactions_chunked(all_txids, verbose=True, chunk=TX_BATCH_CHUNK)
+                        for txid, t in zip(all_txids, tx_results):
+                            if t:
+                                decoded_map[txid] = t
+
+                    # Apply in original height order
+                    block_iter = iter(blocks)
+                    for (height, hh), txs in zip(valid_pairs, per_block_entries):
+                        bi = next(block_iter, None)
+                        if not bi:
+                            print(f"Failed to get block for height {height}.")
+                            continue
+
+                        replace_block_in_db(bi, current_block_height, conn)
+                        time_epoch = _normalize_block_time(bi.get('time'))
+
+                        if txs:
+                            if isinstance(txs[0], dict):
+                                for t in txs:
+                                    replace_transaction_in_db(t, height, hh, time_epoch, conn, do_address_updates=False)
+                            else:
+                                for txid in txs:
+                                    t = decoded_map.get(txid)
+                                    if t is None:
+                                        t = getrawtransaction(txid, verbose=True)
+                                        if not t:
+                                            continue
+                                    replace_transaction_in_db(t, height, hh, time_epoch, conn, do_address_updates=False)
+
+                        idx += 1
+                        if idx % COMMIT_INTERVAL == 0:
+                            conn.commit()
+                            conn.execute('BEGIN IMMEDIATE')
+                            print(f"… up to block {height}")
+
+                    # Advance h to next_start or exit if done
+                    h = next_start
+                    if future is None:
+                        break
+            finally:
+                prefetch_pool.shutdown(wait=True)
 
             # Final commit before post-processing
             conn.commit()
             # Recreate indices after bulk load to speed up subsequent queries
             create_indices(conn)
             conn.commit()
-            update_all_addresses(current_block_height)
+            # Bulk rebuild addresses (much faster than per-tx updates)
+            rebuild_addresses(conn, current_block_height)
         else:
             print("No new blocks to add.")
     except Exception as e:
         print(f"Failed to update with latest blocks: {e}")
         conn.rollback()
     finally:
+        try:
+            if os.path.exists(LOCK_FILE):
+                os.remove(LOCK_FILE)
+        except Exception:
+            pass
         conn.close()
 
 
 def update_with_latest_block():
-    with sqlite3.connect(DATABASE) as conn:
+    # Back off if a reindex is in progress
+    if os.path.exists(LOCK_FILE):
+        print("Reindex lock present — skipping incremental update this cycle.")
+        return
+    with sqlite3.connect(DATABASE, timeout=5) as conn:
         c = conn.cursor()
         try:
             c.execute('SELECT MAX(block_height) FROM blocks')
@@ -614,7 +820,7 @@ def update_with_latest_block():
 
 
 def get_address_balance(address):
-    with sqlite3.connect(DATABASE) as conn:
+    with sqlite3.connect(DATABASE, timeout=5) as conn:
         c = conn.cursor()
         c.execute('SELECT balance FROM addresses WHERE address = ?', (address,))
         row = c.fetchone()
@@ -630,7 +836,7 @@ def calculate_total_supply():
     where 'burnt' is a cumulative value stored on the latest block (chain tip).
     Falls back to SUM(addresses.balance) if block metadata is not yet populated.
     """
-    with sqlite3.connect(DATABASE) as conn:
+    with sqlite3.connect(DATABASE, timeout=5) as conn:
         c = conn.cursor()
         # 1) cumulative minted across all blocks
         c.execute('SELECT SUM(mint) FROM blocks')
@@ -654,7 +860,7 @@ def get_total_burnt():
     """
     Returns the cumulative amount burned (value from the latest block).
     """
-    with sqlite3.connect(DATABASE) as conn:
+    with sqlite3.connect(DATABASE, timeout=5) as conn:
         c = conn.cursor()
         c.execute('SELECT burnt FROM blocks ORDER BY block_height DESC LIMIT 1')
         row = c.fetchone()
@@ -662,7 +868,7 @@ def get_total_burnt():
 
 
 def test_get_address_info(address):
-    with sqlite3.connect(DATABASE) as conn:
+    with sqlite3.connect(DATABASE, timeout=5) as conn:
         c = conn.cursor()
         c.execute('SELECT address, '
                   'total_received, '
