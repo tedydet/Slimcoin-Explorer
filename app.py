@@ -5,6 +5,9 @@ import re
 from database import get_total_burnt, calculate_total_supply
 
 app = Flask(__name__)
+from werkzeug.middleware.proxy_fix import ProxyFix
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_host=1, x_proto=1)
+app.config['PREFERRED_URL_SCHEME'] = 'https'
 DATABASE = 'blockchain.db'
 PEERS = 'peers.db'
 
@@ -427,20 +430,20 @@ def search():
     if query.isdigit():  # Search for block index
         block = search_block_by_index(query)
         if block:
-            return redirect(url_for('block_detail', block_hash=block['block_hash'], _external=True, _scheme='http'))
+            return redirect(url_for('block_detail', block_hash=block['block_hash']))
 
     elif len(query) == 64:  # Length of a TX or Block hash
         tx = search_transaction(query)
         if tx:
-            return redirect(url_for('transaction_detail', txid=query, _external=True, _scheme='http'))
+            return redirect(url_for('transaction_detail', txid=query))
         block = search_block_by_hash(query)
         if block:
-            return redirect(url_for('block_detail', block_hash=query, _external=True, _scheme='http'))
+            return redirect(url_for('block_detail', block_hash=query))
 
     elif len(query) == 34:  # Length of a Bitcoin-based address
         address = search_address(query)
         if address:
-            return redirect(url_for('address_detail', address=query, _external=True, _scheme='http'))
+            return redirect(url_for('address_detail', address=query))
 
     # If nothing is found, show a message or reload the start page
     return render_template('not_found.html'), 404
