@@ -113,6 +113,7 @@ def rpc_batch(method_params_list):
         print(f"RPC batch failed: {e}")
         return []
 
+
 def batch_getblockhashes(heights):
     calls = [("getblockhash", [h]) for h in heights]
     results = rpc_batch(calls)
@@ -123,6 +124,7 @@ def batch_getblockhashes(heights):
         else:
             out.append(item.get("result"))
     return out
+
 
 def batch_getblocks(hashes):
     calls = [("getblock", [h]) for h in hashes]
@@ -135,12 +137,14 @@ def batch_getblocks(hashes):
             out.append(item.get("result"))
     return out
 
+
 # --- getblock verbose auto helpers ---
 def _block_has_decoded_txs(block_obj: dict) -> bool:
     if not isinstance(block_obj, dict):
         return False
     txs = block_obj.get('tx')
     return isinstance(txs, list) and len(txs) > 0 and isinstance(txs[0], dict) and 'vin' in txs[0] and 'vout' in txs[0]
+
 
 def detect_getblock_verbose_mode():
     """
@@ -166,6 +170,7 @@ def detect_getblock_verbose_mode():
     except Exception:
         pass
     return 'ids_only'
+
 
 def batch_getblocks_verbose_auto(hashes, mode: str):
     """
@@ -207,6 +212,7 @@ def _fetch_block_batch(heights, mode):
     blocks = batch_getblocks_verbose_auto(hash_list, mode) if hash_list else []
     return valid_pairs, blocks
 
+
 def batch_getrawtransactions(txids, verbose=True):
     if verbose:
         calls = [("getrawtransaction", [txid, 1]) for txid in txids]
@@ -220,6 +226,7 @@ def batch_getrawtransactions(txids, verbose=True):
         else:
             out.append(item.get("result"))
     return out
+
 
 # Helper: fetch raw transactions in chunks to avoid overloading node
 def batch_getrawtransactions_chunked(txids, verbose=True, chunk=TX_BATCH_CHUNK):
@@ -466,6 +473,7 @@ def ensure_tables_exist(conn):
         conn.commit()
     finally:
         c.close()
+
 
 def replace_block_in_db(_block_info, current_height, conn):
     _block_hash = _block_info['hash']
