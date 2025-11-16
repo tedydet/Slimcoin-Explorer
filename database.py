@@ -6,6 +6,10 @@ import os
 from decimal import Decimal
 from datetime import datetime, timezone
 
+# Reusable HTTP session for RPC calls
+_session = requests.Session()
+_session.headers.update({'content-type': 'application/json'})
+
 
 def _normalize_block_time(t):
     if isinstance(t, int):
@@ -37,7 +41,6 @@ PEERS = 'peers.db'
 def rpc_request(method, params=None):
     if params is None:
         params = []
-    headers = {'content-type': 'application/json'}
     payload = {
         "jsonrpc": "1.0",
         "id": "curltest",
@@ -45,12 +48,16 @@ def rpc_request(method, params=None):
         "params": params
     }
     try:
-        _response = requests.post(f"{rpc_prefix}://{rpc_user}:{rpc_password}@{rpc_host}:{rpc_port}",
-                                  data=json.dumps(payload), headers=headers, verify=True)
+        _response = _session.post(
+            f"{rpc_prefix}://{rpc_user}:{rpc_password}@{rpc_host}:{rpc_port}",
+            data=json.dumps(payload),
+            timeout=60,
+            verify=True
+        )
         _response.raise_for_status()
         return _response.json()
     except requests.exceptions.RequestException as e:
-        print(f"RPC call failed: {e}")  #
+        print(f"RPC call failed: {e}")
         return {"error": str(e)}
 
 
@@ -86,10 +93,15 @@ def get_block_info(_block_hash):
     return _response.get('result')
 
 
-def getrawtransaction(_tx_hash):
-    _response = rpc_request('getrawtransaction', [_tx_hash])
+def getrawtransaction(_tx_hash, verbose=True):
+    """
+    If verbose=True, returns the decoded transaction object directly (1-call).
+    Otherwise returns the raw hex string.
+    """
+    params = [_tx_hash, 1] if verbose else [_tx_hash]
+    _response = rpc_request('getrawtransaction', params)
     if _response.get('error') is not None:
-        print(f"Send transaction failed: {_response['error']}")
+        print(f"getrawtransaction failed: {_response['error']}")
         return None
     return _response.get('result')
 
@@ -176,6 +188,13 @@ def reinitialize_tables():
         last_updated INTEGER NOT NULL
     )
     ''')
+
+    # Helpful indices for faster indexing and querying
+    c.execute('CREATE INDEX IF NOT EXISTS idx_blocks_height   ON blocks(block_height)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_tx_block        ON transactions(block_hash)')
+    c.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_vout_txn ON vout(txid, ind)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_vout_addr       ON vout(address)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_vin_outref      ON vin(vout_txid, vout_index)')
 
     conn.commit()
     conn.close()
@@ -390,7 +409,6 @@ def reindex_db():
                         continue
                     print(f"Adding block {block_height} to database: {block_hash}")
                     block_info = get_block_info(block_hash)
-                    print(f"Block info: {block_info}.")
                     if not block_info:
                         print(f"Failed to get block info for block {block_hash}.")
                         continue
@@ -398,13 +416,9 @@ def reindex_db():
                     replace_block_in_db(block_info)
                     time_epoch = _normalize_block_time(block_info.get('time'))
                     for tx_id in block_info.get('tx', []):
-                        raw_tx = getrawtransaction(tx_id)
-                        if not raw_tx:
-                            print(f"getrawtransaction failed for {tx_id}")
-                            continue
-                        decoded_tx = decoderawtransaction(raw_tx)
+                        decoded_tx = getrawtransaction(tx_id, verbose=True)
                         if not decoded_tx:
-                            print(f"decoderawtransaction failed for {tx_id}")
+                            print(f"getrawtransaction (verbose) failed for {tx_id}")
                             continue
                         replace_transaction_in_db(decoded_tx, block_height, block_hash, time_epoch)
 
@@ -451,10 +465,7 @@ def update_with_latest_block():
                         replace_block_in_db(block_info)
                         time_epoch = _normalize_block_time(block_info.get('time'))
                         for tx_id in block_info.get('tx', []):
-                            raw_tx = getrawtransaction(tx_id)
-                            if not raw_tx:
-                                continue
-                            decoded_tx = decoderawtransaction(raw_tx)
+                            decoded_tx = getrawtransaction(tx_id, verbose=True)
                             if not decoded_tx:
                                 continue
                             replace_transaction_in_db(decoded_tx, block_height, block_hash, time_epoch)
