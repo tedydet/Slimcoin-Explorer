@@ -887,7 +887,7 @@ def reindex_db(start_height=None):
                             if txs:
                                 if isinstance(txs[0], dict):
                                     for t in txs:
-                                        replace_transaction_in_db(t, height, hh, time_epoch, conn, do_address_updates=False)
+                                        replace_transaction_in_db(t, height, hh, time_epoch, conn, do_address_updates=True)
                                 else:
                                     for txid in txs:
                                         t = decoded_map.get(txid)
@@ -895,7 +895,7 @@ def reindex_db(start_height=None):
                                             t = getrawtransaction(txid, verbose=True)
                                             if not t:
                                                 continue
-                                        replace_transaction_in_db(t, height, hh, time_epoch, conn, do_address_updates=False)
+                                        replace_transaction_in_db(t, height, hh, time_epoch, conn, do_address_updates=True)
 
                             idx += 1
                             if idx % COMMIT_INTERVAL == 0:
@@ -996,7 +996,7 @@ def reindex_db(start_height=None):
                     if txs:
                         if isinstance(txs[0], dict):
                             for t in txs:
-                                replace_transaction_in_db(t, height, hh, time_epoch, conn, do_address_updates=False)
+                                replace_transaction_in_db(t, height, hh, time_epoch, conn, do_address_updates=True)
                         else:
                             for txid in txs:
                                 t = decoded_map.get(txid)
@@ -1004,7 +1004,7 @@ def reindex_db(start_height=None):
                                     t = getrawtransaction(txid, verbose=True)
                                     if not t:
                                         continue
-                                replace_transaction_in_db(t, height, hh, time_epoch, conn, do_address_updates=False)
+                                replace_transaction_in_db(t, height, hh, time_epoch, conn, do_address_updates=True)
 
                     idx += 1
                     if idx % COMMIT_INTERVAL == 0:
@@ -1111,7 +1111,7 @@ def reindex_db_continue(rewind: int = CONTINUE_REWIND):
                         if txs:
                             if isinstance(txs[0], dict):
                                 for t in txs:
-                                    replace_transaction_in_db(t, height, hh, time_epoch, conn, do_address_updates=False)
+                                    replace_transaction_in_db(t, height, hh, time_epoch, conn, do_address_updates=True)
                             else:
                                 for txid in txs:
                                     t = decoded_map.get(txid)
@@ -1119,7 +1119,7 @@ def reindex_db_continue(rewind: int = CONTINUE_REWIND):
                                         t = getrawtransaction(txid, verbose=True)
                                         if not t:
                                             continue
-                                    replace_transaction_in_db(t, height, hh, time_epoch, conn, do_address_updates=False)
+                                    replace_transaction_in_db(t, height, hh, time_epoch, conn, do_address_updates=True)
 
                         idx += 1
                         if idx % COMMIT_INTERVAL == 0:
