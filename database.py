@@ -429,11 +429,25 @@ def reinitialize_tables():
 
 def create_indices(conn):
     c = conn.cursor()
+    # --- Existing helpful indexes ---
     c.execute('CREATE INDEX IF NOT EXISTS idx_blocks_height   ON blocks(block_height)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_tx_block        ON transactions(block_hash)')
     c.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_vout_txn ON vout(txid, ind)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_vout_addr       ON vout(address)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_vin_outref      ON vin(vout_txid, vout_index)')
+
+    # --- Additions for runtime performance (richlist, address, and purge speed) ---
+    # Composite for address lookups that also filter by spent
+    c.execute('CREATE INDEX IF NOT EXISTS idx_vout_addr_spent ON vout(address, spent)')
+    # Partial index for unspent-per-address (fast balance/richlist during reindex, if SQLite supports partial indexes)
+    c.execute('CREATE INDEX IF NOT EXISTS idx_vout_addr_unspent ON vout(address) WHERE spent = 0')
+    # Speed up deletions/purges and joins by block
+    c.execute('CREATE INDEX IF NOT EXISTS idx_vout_blockhash   ON vout(block_hash)')
+    # Speed up purge step which deletes vin rows by their own txid
+    c.execute('CREATE INDEX IF NOT EXISTS idx_vin_txid         ON vin(txid)')
+    # Help ORDER BY balance DESC LIMIT N on /richlist
+    c.execute('CREATE INDEX IF NOT EXISTS idx_addresses_balance ON addresses(balance)')
+
     c.close()
 
 
@@ -445,7 +459,12 @@ def drop_indices(conn):
         'idx_tx_block',
         'idx_vout_txn',
         'idx_vout_addr',
-        'idx_vin_outref'
+        'idx_vin_outref',
+        'idx_vout_addr_spent',
+        'idx_vout_addr_unspent',
+        'idx_vout_blockhash',
+        'idx_vin_txid',
+        'idx_addresses_balance',
     ]:
         c.execute(f'DROP INDEX IF EXISTS {idx}')
     c.close()

@@ -58,9 +58,12 @@ def get_blocks():
 def get_block_detail(block_hash):
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT * FROM blocks WHERE block_hash = ?", (block_hash,))
+    c.execute("SELECT * FROM blocks WHERE LOWER(block_hash) = LOWER(?)", (block_hash,))
     block = c.fetchone()
-    c.execute("SELECT txid, amount FROM transactions WHERE block_hash = ?", (block_hash,))
+    if not block:
+        conn.close()
+        return None
+    c.execute("SELECT txid, amount FROM transactions WHERE block_hash = ?", (block['block_hash'],))
     transactions = [{'txid': tx['txid'], 'amount': tx['amount']} for tx in c.fetchall()]
     block_details = {
         'block_height': block['block_height'],
@@ -79,7 +82,6 @@ def get_block_detail(block_hash):
     conn.close()
     return block_details
 
-
 @app.route('/')
 def index():
     blocks = get_blocks()
@@ -93,7 +95,9 @@ def stats_frame():
 
 @app.route('/block/<block_hash>')
 def block_detail(block_hash):
-    block = get_block_detail(block_hash)  # Function that calls block and transaction details
+    block = get_block_detail(block_hash)
+    if not block:
+        return render_template('not_found.html'), 404
     return render_template('block_detail.html', block=block)
 
 
@@ -156,16 +160,24 @@ def transaction_detail(txid):
     c.execute("""
         SELECT tx.txid, tx.amount, tx.block_hash, b.timestamp, b.confirmations, tx.is_coinbase
         FROM transactions tx
-        JOIN blocks b ON tx.block_hash = b.block_hash
+        LEFT JOIN blocks b ON tx.block_hash = b.block_hash
         WHERE tx.txid = ?
     """, (txid,))
     transaction_row = c.fetchone()
 
-    # Convert the Row object into a Dictionary
-    transaction = dict(transaction_row)
-    transaction['timestamp'] = datetime.fromtimestamp(transaction['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
+    if not transaction_row:
+        conn.close()
+        return render_template('not_found.html'), 404
 
-    # Determine recipient addresses and amounts
+    transaction = dict(transaction_row)
+
+    ts = transaction.get('timestamp')
+    if ts is not None:
+        transaction['timestamp'] = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+    else:
+        transaction['timestamp'] = 'unknown'
+
+    # Outputs
     c.execute("""
         SELECT vout.address as recipient, SUM(vout.amount) as amount
         FROM vout
@@ -174,7 +186,7 @@ def transaction_detail(txid):
     """, (txid,))
     outputs = [{'recipient': row['recipient'], 'amount': row['amount']} for row in c.fetchall()]
 
-    # Determine the sender addresses and amounts
+    # Inputs
     c.execute("""
         SELECT vout.address as sender, SUM(vout.amount) as amount
         FROM vin
@@ -186,16 +198,16 @@ def transaction_detail(txid):
 
     conn.close()
 
-    mining_status = "Yes" if transaction['is_coinbase'] else "No"
+    mining_status = "Yes" if transaction.get('is_coinbase') else "No"
 
-    # Fetch reward consensus flag and effective burn coins if this is a block reward
     reward_flag = None
     effective_burn_coins = None
     try:
         if transaction.get('is_coinbase') and transaction.get('block_hash'):
             with get_db_connection() as conn2:
                 c2 = conn2.cursor()
-                c2.execute("SELECT flags, effective_burn_coins FROM blocks WHERE block_hash = ?", (transaction['block_hash'],))
+                c2.execute("SELECT flags, effective_burn_coins FROM blocks WHERE LOWER(block_hash) = LOWER(?)",
+                           (transaction['block_hash'],))
                 row = c2.fetchone()
                 if row:
                     reward_flag = row['flags']
@@ -209,7 +221,7 @@ def transaction_detail(txid):
                            inputs=inputs,
                            mining_status=mining_status,
                            reward_flag=reward_flag,
-                           effective_burn_coins = float(round(((effective_burn_coins or 0) / 1_000_000), 5)))
+                           effective_burn_coins=float(round(((effective_burn_coins or 0)/1_000_000), 5)))
 
 
 @app.route('/address/<address>')
@@ -285,9 +297,10 @@ def address_detail(address, page=1):
     """, (address, address, per_page, offset))
     transactions = [{
         'txid': tx['txid'],
-        'amount': tx['total_amount'],
+        'amount': float(tx['total_amount'] or 0),
         'block_hash': tx['block_hash'],
-        'timestamp': datetime.fromtimestamp(tx['timestamp']).strftime('%Y-%m-%d %H:%M:%S'),
+        'timestamp': (datetime.fromtimestamp(tx['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
+                      if tx['timestamp'] is not None else 'unknown'),
         'type': tx['type']
     } for tx in c.fetchall()]
 
@@ -453,18 +466,28 @@ def search():
 def rich_list():
     conn = get_db_connection()
     c = conn.cursor()
-    total_supply = calculate_total_supply()  # Use your existing function to calculate the total supply
+
+    # Circulating Supply (minted – burnt) als Basis für Prozentwerte
+    total_supply = calculate_total_supply()
 
     c.execute("""
-        SELECT address, balance AS total_amount, (balance / ? * 100) AS percentage
+        SELECT
+            address,
+            COALESCE(balance, 0) AS total_amount,
+            (COALESCE(balance, 0) * 1.0 / ? * 100.0) AS percentage
         FROM addresses
-        ORDER BY total_amount DESC
+        WHERE COALESCE(balance, 0) > 0
+        ORDER BY total_amount DESC, address ASC
         LIMIT 100
-    """, (total_supply,))
+    """, (total_supply or 1.0,))
     wallets = c.fetchall()
     conn.close()
 
-    return render_template('rich_list.html', wallets=wallets, total_supply=total_supply)
+    return render_template(
+        'rich_list.html',
+        wallets=wallets,
+        total_supply=round(total_supply or 0.0, 2)
+    )
 
 
 @app.route('/network')
@@ -485,14 +508,14 @@ def search_block_by_index(index):
 def search_block_by_hash(hash):
     with sqlite3.connect(DATABASE) as conn:
         c = conn.cursor()
-        c.execute('SELECT * FROM blocks WHERE block_hash = ?', (hash,))
+        c.execute('SELECT * FROM blocks WHERE LOWER(block_hash) = LOWER(?)', (hash,))
         return c.fetchone()
 
 
 def search_transaction(txid):
     with sqlite3.connect(DATABASE) as conn:
         c = conn.cursor()
-        c.execute('SELECT * FROM transactions WHERE txid = ?', (txid,))
+        c.execute('SELECT * FROM transactions WHERE LOWER(txid) = LOWER(?)', (txid,))
         return c.fetchone()
 
 
