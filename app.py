@@ -8,6 +8,18 @@ app = Flask(__name__)
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_host=1, x_proto=1)
 app.config['PREFERRED_URL_SCHEME'] = 'https'
+# Lightweight caching for frequently-hit routes (safe fallback if library is missing)
+try:
+    from flask_caching import Cache
+    cache = Cache(app, config={"CACHE_TYPE": "SimpleCache", "CACHE_DEFAULT_TIMEOUT": 15})
+except Exception:
+    # No-op cache if flask_caching is unavailable
+    class _NoCache:
+        def cached(self, *args, **kwargs):
+            def wrapper(fn):
+                return fn
+            return wrapper
+    cache = _NoCache()
 DATABASE = 'blockchain.db'
 PEERS = 'peers.db'
 
@@ -103,32 +115,42 @@ def block_detail(block_hash):
 
 @app.route('/blocks_frame')
 @app.route('/blocks_frame/<int:page>')
+@cache.cached(timeout=15, query_string=True)
 def blocks_frame(page=1):
     per_page = 10  # Number of blocks per page
     offset = (page - 1) * per_page
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM blocks")
-    total_blocks = c.fetchone()[0]
-    total_pages = (total_blocks + per_page - 1) // per_page  # Calculates total pages
+    # Faster page count via indexed MAX(block_height)
+    c.execute("SELECT MAX(block_height) FROM blocks")
+    max_h = c.fetchone()[0] or 0
+    total_blocks = max_h + 1
+    total_pages = (total_blocks + per_page - 1) // per_page
 
     c.execute("""
-        SELECT 
-            b.block_height,
-            b.block_hash,
-            b.timestamp,
-            b.flags,
-            b.effective_burn_coins,
-            b.mint,
-            b.burnt,
-            IFNULL(SUM(t.amount), 0) as total_amount
-        FROM blocks b
-        LEFT JOIN transactions t ON b.block_hash = t.block_hash
-        GROUP BY 
-            b.block_height, b.block_hash, b.timestamp,
-            b.flags, b.effective_burn_coins, b.mint, b.burnt
-        ORDER BY b.block_height DESC
+    WITH latest AS (
+        SELECT block_height, block_hash, timestamp, flags,
+               effective_burn_coins, mint, burnt
+        FROM blocks
+        ORDER BY block_height DESC
         LIMIT ? OFFSET ?
+    )
+    SELECT
+        l.block_height,
+        l.block_hash,
+        l.timestamp,
+        l.flags,
+        l.effective_burn_coins,
+        l.mint,
+        l.burnt,
+        IFNULL(SUM(t.amount), 0) AS total_amount
+    FROM latest l
+    LEFT JOIN transactions t
+      ON t.block_hash = l.block_hash
+    GROUP BY
+        l.block_height, l.block_hash, l.timestamp,
+        l.flags, l.effective_burn_coins, l.mint, l.burnt
+    ORDER BY l.block_height DESC
     """, (per_page, offset))
     blocks_raw = c.fetchall()
     blocks = [
