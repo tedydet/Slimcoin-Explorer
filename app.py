@@ -4,10 +4,16 @@ from datetime import datetime
 import re
 from database import get_total_burnt, calculate_total_supply
 
+# Flask app setup
 app = Flask(__name__)
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_host=1, x_proto=1)
 app.config['PREFERRED_URL_SCHEME'] = 'https'
+
+# Jinja2 bytecode cache to reduce first-render CPU
+from jinja2 import FileSystemBytecodeCache
+app.config['TEMPLATES_AUTO_RELOAD'] = False
+app.jinja_env.bytecode_cache = FileSystemBytecodeCache(cache_dir='/tmp/jinja_cache', prefix='slmexp_')
 # Lightweight caching for frequently-hit routes (safe fallback if library is missing)
 try:
     from flask_caching import Cache
@@ -27,6 +33,14 @@ PEERS = 'peers.db'
 def get_db_connection():
     conn = sqlite3.connect(DATABASE)
     conn.row_factory = sqlite3.Row
+    # Light SQLite tuning: improves read performance and reduces first-hit latency
+    try:
+        conn.execute('PRAGMA journal_mode=WAL;')
+        conn.execute('PRAGMA synchronous=NORMAL;')
+        conn.execute('PRAGMA temp_store=MEMORY;')
+        conn.execute('PRAGMA cache_size=-20000;')  # ~20 MB page cache; adjust for device RAM
+    except Exception:
+        pass
     return conn
 
 
@@ -669,6 +683,19 @@ def consensus_stats_api():
     stats = consensus_stats_last_n(last)
     return jsonify(stats)
 
+
+
+# Warmup to prefill caches on first request
+@app.before_first_request
+def _warm_caches():
+    try:
+        with app.test_client() as c:
+            c.get('/blocks_frame?page=1')
+            c.get('/richlist')
+            c.get('/blockchain-stats')
+            c.get('/consensus-stats')
+    except Exception as e:
+        app.logger.warning(f"warmup failed: {e}")
 
 if __name__ == '__main__':
     app.run(debug=False)
