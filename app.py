@@ -3,6 +3,7 @@ import sqlite3
 from datetime import datetime
 import re
 from database import get_total_burnt, calculate_total_supply
+from threading import Lock
 
 # Flask app setup
 app = Flask(__name__)
@@ -12,8 +13,10 @@ app.config['PREFERRED_URL_SCHEME'] = 'https'
 
 # Jinja2 bytecode cache to reduce first-render CPU
 from jinja2 import FileSystemBytecodeCache
+import os
 app.config['TEMPLATES_AUTO_RELOAD'] = False
-app.jinja_env.bytecode_cache = FileSystemBytecodeCache(cache_dir='/tmp/jinja_cache', prefix='slmexp_')
+os.makedirs('/tmp/jinja_cache', exist_ok=True)
+app.jinja_env.bytecode_cache = FileSystemBytecodeCache(directory='/tmp/jinja_cache', pattern='slmexp_%s.cache')
 # Lightweight caching for frequently-hit routes (safe fallback if library is missing)
 try:
     from flask_caching import Cache
@@ -684,18 +687,39 @@ def consensus_stats_api():
     return jsonify(stats)
 
 
+# Warmup to prefill caches once (Flask >= 3 compatible)
+_did_warm = False
+_warm_lock = Lock()
 
-# Warmup to prefill caches on first request
-@app.before_first_request
-def _warm_caches():
-    try:
-        with app.test_client() as c:
-            c.get('/blocks_frame?page=1')
-            c.get('/richlist')
-            c.get('/blockchain-stats')
-            c.get('/consensus-stats')
-    except Exception as e:
-        app.logger.warning(f"warmup failed: {e}")
+def _do_warm():
+    # Call view functions inside a request context so @cache.cached greift
+    with app.app_context():
+        with app.test_request_context('/'):
+            try:
+                blocks_frame(page=1)
+                rich_list()
+                blockchain_stats()
+                consensus_stats()
+            except Exception as e:
+                app.logger.warning(f"warmup failed: {e}")
+
+@app.before_request
+def _maybe_warm_caches():
+    # Start once per process; Lock prevents race conditions
+    global _did_warm
+    if not _did_warm:
+        with _warm_lock:
+            if not _did_warm:
+                _do_warm()
+                _did_warm = True
+
+# optional: pre-warm in the background immediately after import,
+# so that the very first request renders faster.
+try:
+    import threading
+    threading.Thread(target=_do_warm, daemon=True).start()
+except Exception as e:
+    app.logger.warning(f"background warmup thread failed: {e}")
 
 if __name__ == '__main__':
     app.run(debug=False)
