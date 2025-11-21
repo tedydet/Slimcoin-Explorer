@@ -86,6 +86,35 @@ def hash160(b: bytes) -> bytes:
     ripe = hashlib.new("ripemd160", sha).digest()
     return ripe
 
+# --- Merkle root computation (Bitcoin-style, double-SHA256) ---
+def compute_merkle_root_hex(txids):
+    """
+    Compute the Merkle root (Bitcoin-style, double-SHA256) of a list of txids.
+
+    txids: list of 64-char hex strings in RPC (big-endian) form.
+    Returns the Merkle root as 64-char hex string in RPC (big-endian) form.
+    """
+    if not txids:
+        # Slimcoin blocks should always have at least one transaction,
+        # but return zero root as a safeguard.
+        return "0" * 64
+
+    # Convert to little-endian bytes for internal Merkle computation
+    hashes = [bytes.fromhex(txid)[::-1] for txid in txids]
+
+    while len(hashes) > 1:
+        if len(hashes) % 2 == 1:
+            # If odd number of elements, duplicate the last one
+            hashes.append(hashes[-1])
+        new_level = []
+        for i in range(0, len(hashes), 2):
+            new_level.append(hash256(hashes[i] + hashes[i + 1]))
+        hashes = new_level
+
+    # Final Merkle root as little-endian; convert back to big-endian hex
+    root_le = hashes[0]
+    return root_le[::-1].hex()
+
 
 def b58encode(b: bytes) -> str:
     # count leading zeros (-> "1" prefix in Base58)
@@ -312,8 +341,8 @@ def parse_block_header(block_bytes: bytes):
     return parse_block_header_bytes(header, USE_REVERSED_HASH)
 
 
-# --- robust transaction parser for Slimcoin blocks (handles PoB extra data) ---
-def parse_block_transactions(block_bytes: bytes):
+# --- robust transaction parser for Slimcoin blocks (handles PoB extra data, validates Merkle root) ---
+def parse_block_transactions(block_bytes: bytes, expected_merkle: str):
     """Parse all transactions from a Slimcoin block body.
 
     Some Slimcoin blocks (e.g. proof-of-burn or other special cases) can carry
@@ -321,8 +350,13 @@ def parse_block_transactions(block_bytes: bytes):
       - try multiple candidate offsets ("skip" bytes) between the 80-byte
         header and the tx-count varint,
       - try both tx layouts (with and without nTime),
-      - choose the variant that leaves the *smallest* unused tail in the
-        block body.
+      - for each candidate, compute the Merkle root from parsed txids and
+        require it to match the header's merkle_root,
+      - among all matching candidates, choose the one that leaves the
+        smallest unused tail in the block body.
+
+    This Merkle-root check makes the transaction parsing robust against
+    layout ambiguities and ensures that txids match the block header.
     """
     if len(block_bytes) <= 80:
         return []
@@ -333,9 +367,7 @@ def parse_block_transactions(block_bytes: bytes):
     best_txs = None
     best_remaining = None
 
-    # Try candidate offsets up to 256 bytes; normal blocks succeed at skip=0.
-    # Some Slimcoin blocks (especially PoS/PoB) appear to have a longer
-    # extended header between the 80-byte core header and the tx vector.
+    # Candidate offsets up to 256 bytes; normal blocks succeed at skip=0.
     max_skip = min(256, len(body))
     for skip in range(0, max_skip + 1):
         for allow_time in (True, False):
@@ -354,13 +386,19 @@ def parse_block_transactions(block_bytes: bytes):
                     # We read past the end; this variant is invalid
                     continue
 
+                # Compute Merkle root from parsed txids and compare to header
+                txids = [tx["txid"] for tx in txs]
+                merkle_hex = compute_merkle_root_hex(txids)
+                if merkle_hex != expected_merkle:
+                    # Layout does not match header's Merkle root
+                    continue
+
                 # Prefer variants that leave less unparsed data at the end.
                 if best_txs is None or remaining < best_remaining:
                     best_txs = txs
                     best_remaining = remaining
 
-                    # If we have a perfect match (no remaining bytes), we can
-                    # stop searching.
+                    # Perfect match: no remaining bytes -> stop searching.
                     if best_remaining == 0:
                         return best_txs
 
@@ -369,8 +407,8 @@ def parse_block_transactions(block_bytes: bytes):
                 continue
 
     if best_txs is not None:
-        # At least one variant was found that parsed tx_count transactions
-        # without overrunning the buffer. Accept the best match even if some
+        # At least one variant was found that matched the Merkle root and
+        # did not overrun the buffer. Accept the best match even if some
         # trailing bytes remain unparsed (assumed to be Slimcoin-specific
         # metadata).
         return best_txs
@@ -399,7 +437,7 @@ def parse_full_block(block_bytes: bytes):
     bits = hdr["bits"]
     nonce = hdr["nonce"]
 
-    txs = parse_block_transactions(block_bytes)
+    txs = parse_block_transactions(block_bytes, merkle_root)
 
     return {
         "hash": block_hash,
@@ -953,7 +991,7 @@ def import_mainchain_to_db(blocks_dir, workers=1):
 
                     c.execute(
                         """
-                        INSERT INTO vout
+                        INSERT OR IGNORE INTO vout
                           (txid, ind, amount, address, spent, block_hash, created_block_height)
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
@@ -976,7 +1014,7 @@ def import_mainchain_to_db(blocks_dir, workers=1):
                     vout_index = vin["vout_index"]
                     c.execute(
                         """
-                        INSERT INTO vin
+                        INSERT OR IGNORE INTO vin
                           (txid, vout_txid, vout_index)
                         VALUES (?, ?, ?)
                         """,
