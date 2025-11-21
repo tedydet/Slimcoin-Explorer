@@ -2,7 +2,6 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta http-equiv="refresh" content="60">
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
     <title>Blockchain Stats</title>
 </head>
@@ -21,5 +20,43 @@
         <div class="card-content"><strong>{{ hash_rate }} kH/s</strong></div>
     </div>
 </div>
+
+<script>
+  const REFRESH_MS = 60000; // 60 seconds
+  let timer = null;
+
+  function refreshIfVisible() {
+    if (!document.hidden) {
+      // reload this frame only
+      window.location.reload();
+    }
+  }
+
+  function startTimer() {
+    if (timer === null) {
+      timer = setInterval(refreshIfVisible, REFRESH_MS);
+    }
+  }
+
+  function stopTimer() {
+    if (timer !== null) {
+      clearInterval(timer);
+      timer = null;
+    }
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      stopTimer();
+    } else {
+      refreshIfVisible(); // one immediate refresh when coming back
+      startTimer();
+    }
+  });
+
+  if (!document.hidden) {
+    startTimer();
+  }
+</script>
 </body>
 </html>

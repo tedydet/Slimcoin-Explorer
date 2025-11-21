@@ -4,10 +4,10 @@ from datetime import datetime
 import re
 from database import get_total_burnt, calculate_total_supply
 from threading import Lock
-
-# Flask app setup
-app = Flask(__name__)
 from werkzeug.middleware.proxy_fix import ProxyFix
+# Flask app setup
+
+app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_host=1, x_proto=1)
 app.config['PREFERRED_URL_SCHEME'] = 'https'
 
@@ -691,6 +691,7 @@ def consensus_stats_api():
 _did_warm = False
 _warm_lock = Lock()
 
+
 def _do_warm():
     # Call view functions inside a request context so @cache.cached greift
     with app.app_context():
@@ -703,6 +704,7 @@ def _do_warm():
             except Exception as e:
                 app.logger.warning(f"warmup failed: {e}")
 
+
 @app.before_request
 def _maybe_warm_caches():
     # Start once per process; Lock prevents race conditions
@@ -712,6 +714,7 @@ def _maybe_warm_caches():
             if not _did_warm:
                 _do_warm()
                 _did_warm = True
+
 
 # optional: pre-warm in the background immediately after import,
 # so that the very first request renders faster.

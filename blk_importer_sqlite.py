@@ -15,6 +15,9 @@ import struct
 import sqlite3
 import hashlib
 from io import BytesIO
+from dcrypt_pure import dcrypt_pow_hash
+from multiprocessing import Pool, cpu_count
+
 
 # Ensure the directory of this script is on sys.path so that "database" imports work
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -267,8 +270,10 @@ def difficulty_from_bits(bits: int, diff1_target: int) -> float:
 
 def parse_block_header_bytes(header: bytes, reversed_hash: bool):
     """
-    Parse the 80-byte header and compute block hash / prev-hash according
-    to the chosen endianness model.
+    Parse the 80-byte header and compute Slimcoin block hash / prev-hash.
+
+    - Blockhash: dcrypt_pow_hash(header)[::-1].hex()  (RPC-Stil)
+    - Prev-hash: Headerfeld als little-endian, also raw_prev[::-1].hex()
     """
     if len(header) < 80:
         raise ValueError("Block header too short")
@@ -278,14 +283,13 @@ def parse_block_header_bytes(header: bytes, reversed_hash: bool):
     raw_merkle = header[36:68]
     timestamp, bits, nonce = struct.unpack("<III", header[68:80])
 
-    if reversed_hash:
-        block_hash = hash256(header)[::-1].hex()
-        prev_block = raw_prev[::-1].hex()
-        merkle_root = raw_merkle[::-1].hex()
-    else:
-        block_hash = hash256(header).hex()
-        prev_block = raw_prev.hex()
-        merkle_root = raw_merkle.hex()
+    # Slimcoin PoW: Dcrypt über den *Header*, dann für RPC-Stil byteswappen
+    pow_bytes = dcrypt_pow_hash(header)       # 32 Bytes, big-endian
+    block_hash = pow_bytes[::-1].hex()        # RPC / Explorer / getblockhash-Stil
+
+    # Prev-/Merkle-Hash sind klassische uint256-Felder im Header
+    prev_block = raw_prev[::-1].hex()
+    merkle_root = raw_merkle[::-1].hex()
 
     return {
         "hash": block_hash,
@@ -302,12 +306,10 @@ def parse_block_header_bytes(header: bytes, reversed_hash: bool):
 
 def parse_block_header(block_bytes: bytes):
     """
-    Parse the 80-byte header and compute block hash, using the globally
-    selected endianness model (USE_REVERSED_HASH).
+    Parse the 80-byte header and compute block hash, using Slimcoin Dcrypt PoW.
     """
     header = block_bytes[:80]
     return parse_block_header_bytes(header, USE_REVERSED_HASH)
-
 
 
 # --- robust transaction parser for Slimcoin blocks (handles PoB extra data) ---
@@ -367,8 +369,8 @@ def parse_block_transactions(block_bytes: bytes):
                 continue
 
     if best_txs is not None:
-        # We found at least one variant that parsed tx_count transactions
-        # without overrunning the buffer; accept the best match even if some
+        # At least one variant was found that parsed tx_count transactions
+        # without overrunning the buffer. Accept the best match even if some
         # trailing bytes remain unparsed (assumed to be Slimcoin-specific
         # metadata).
         return best_txs
@@ -440,54 +442,140 @@ def iter_block_bytes(blocks_dir):
                 yield block_bytes, block_size
 
 
+# ----------- iter_block_headers: header-only iterator -----------
+def iter_block_headers(blocks_dir):
+    """
+    Generator over all block headers in blkNNNN.dat files.
+    Yields (header80, block_size).
+    Reads only the 80-byte header, skips the rest of the block payload.
+    """
+    for name in sorted(os.listdir(blocks_dir)):
+        if not (name.startswith("blk") and name.endswith(".dat")):
+            continue
+        middle = name[3:-4]
+        if not middle.isdigit():
+            continue
+        path = os.path.join(blocks_dir, name)
+        with open(path, "rb") as f:
+            while True:
+                magic = f.read(4)
+                if not magic:
+                    break
+                if magic != NETWORK_MAGIC:
+                    raise ValueError(f"Unexpected magic {magic.hex()} in {path}")
+                size_bytes = f.read(4)
+                if len(size_bytes) != 4:
+                    break
+                (block_size,) = struct.unpack("<I", size_bytes)
+                if block_size < 80:
+                    raise ValueError(f"Block size {block_size} too small for header in {path}")
+                header80 = f.read(80)
+                if len(header80) != 80:
+                    break
+                # Skip the remaining payload if any
+                if block_size > 80:
+                    f.seek(block_size - 80, os.SEEK_CUR)
+                yield header80, block_size
+
+
 # ----------- main-chain discovery (pass 1) -----------
 
 
-def _build_chain_for_headers(headers):
+# ----------- multiprocessing header parser helper -----------
+def _parse_header_for_pool(args):
     """
-    Given a headers dict of the form
+    Helper for multiprocessing: parse a single block header in a worker process.
+    Args:
+        args: tuple (header80, block_size)
+    Returns:
+        ("ok", hash, prev_block, time, bits, block_size, None) on success
+        ("err", None, None, None, None, block_size, error_message) on failure
+    """
+    header80, block_size = args
+    try:
+        h = parse_block_header_bytes(header80, True)
+        return ("ok", h["hash"], h["prev_block"], h["time"], h["bits"], block_size, None)
+    except Exception as e:
+        return ("err", None, None, None, None, block_size, str(e))
+
+
+from collections import defaultdict, deque
+
+def _build_chain_for_headers(headers):
+    """Compute heights, main chain and diff1_target from a headers dict.
+
+    headers format:
       {block_hash: {"prev": ..., "time": ..., "bits": ..., "size": ...}}
-    compute:
-      - height_map
-      - main_chain (set of block hashes)
-      - tip_hash, tip_height
-      - diff1_target from the (first) genesis bits
+
+    Returns:
+      height_map:  {block_hash: height}
+      main_chain:  set of block hashes on the selected main chain
+      tip_hash:    hash of the highest block
+      tip_height:  height of the highest block
+      diff1_target: target for difficulty=1 derived from genesis bits
     """
     height_map = {}
     diff1_target = None
 
-    def compute_height(bh):
-        nonlocal diff1_target
-        if bh in height_map:
-            return height_map[bh]
-        prev = headers[bh]["prev"]
-        if not prev or prev not in headers:
-            # genesis
-            height_map[bh] = 0
-            bits = headers[bh]["bits"]
+    # Build forward adjacency (parent -> list of children) and find genesis candidates
+    children = defaultdict(list)
+    genesis_candidates = set()
+
+    for bh, meta in headers.items():
+        prev = meta["prev"]
+        if prev and prev in headers:
+            children[prev].append(bh)
+        else:
+            # No known parent in this header set -> treat as genesis/root
+            genesis_candidates.add(bh)
+
+    if not genesis_candidates:
+        raise RuntimeError("No genesis candidates found when building chain heights")
+
+    # BFS / level-order traversal starting from all genesis blocks
+    q = deque()
+    for g in genesis_candidates:
+        height_map[g] = 0
+        q.append(g)
+        if diff1_target is None:
+            bits = headers[g]["bits"]
             exponent = bits >> 24
             mantissa = bits & 0xFFFFFF
-            diff1_target_local = mantissa * (1 << (8 * (exponent - 3)))
-            if diff1_target is None:
-                diff1_target = diff1_target_local
-            return 0
-        h_prev = compute_height(prev)
-        height_map[bh] = h_prev + 1
-        return height_map[bh]
+            diff1_target = mantissa * (1 << (8 * (exponent - 3)))
 
-    for bh in list(headers.keys()):
-        compute_height(bh)
+    processed = 0
+    total = len(headers)
+
+    while q:
+        cur = q.popleft()
+        processed += 1
+        if processed % 50000 == 0 or processed == total:
+            print(f"[pass1]   computed heights for {processed}/{total} headers...", flush=True)
+
+        cur_height = height_map[cur]
+        for child in children.get(cur, []):
+            # If we already have a height for this child, keep the first one
+            # (there should be no alternative shorter path in a proper chain).
+            if child in height_map:
+                continue
+            height_map[child] = cur_height + 1
+            q.append(child)
 
     if not height_map:
         raise RuntimeError("No block heights computed (empty headers?)")
 
+    # Select tip as the block with the maximum height
     tip_hash = max(height_map.keys(), key=lambda bh: height_map[bh])
     tip_height = height_map[tip_hash]
 
-    # walk back from tip to genesis to get main chain set
+    # Walk back from tip to genesis to obtain the main chain set
     main_chain = set()
+    visited_backwards = set()
     cur = tip_hash
     while True:
+        if cur in visited_backwards:
+            raise RuntimeError("Cycle detected while walking back main chain from tip")
+        visited_backwards.add(cur)
         main_chain.add(cur)
         prev = headers[cur]["prev"]
         if not prev or prev not in headers:
@@ -504,13 +592,13 @@ def _build_chain_for_headers(headers):
     return height_map, main_chain, tip_hash, tip_height, diff1_target
 
 
-def build_chain_headers(blocks_dir):
+def build_chain_headers(blocks_dir, workers=1):
     """
     Pass 1:
       - scan all headers from blk*.dat
-      - try both possible hash/prev endianness conventions
-      - pick the one that yields the highest tip height
+      - use only reversed hashes (Bitcoin-style)
       - compute heights and determine main chain
+      Optionally uses multiple worker processes for Dcrypt header hashing.
     Returns:
       headers:    {block_hash: {prev, time, bits, size}}
       height_map: {block_hash: height}
@@ -519,89 +607,230 @@ def build_chain_headers(blocks_dir):
       diff1_target: target for difficulty=1 derived from genesis bits
     """
     global USE_REVERSED_HASH
-
-    headers_A = {}  # reversed hashes (Bitcoin-style)
-    headers_B = {}  # raw little-endian hashes
-
+    USE_REVERSED_HASH = True
+    headers = {}
+    header_count = 0
     print("[pass1] Scanning blk*.dat headers...")
-    for block_bytes, block_size in iter_block_bytes(blocks_dir):
-        if len(block_bytes) < 80:
-            continue
-        header = block_bytes[:80]
-
-        # Variant A: reversed hashes (usual Bitcoin / RPC-style)
-        hA = parse_block_header_bytes(header, True)
-        headers_A[hA["hash"]] = {
-            "prev": hA["prev_block"],
-            "time": hA["time"],
-            "bits": hA["bits"],
-            "size": block_size,
-        }
-
-        # Variant B: raw little-endian hex strings
-        hB = parse_block_header_bytes(header, False)
-        headers_B[hB["hash"]] = {
-            "prev": hB["prev_block"],
-            "time": hB["time"],
-            "bits": hB["bits"],
-            "size": block_size,
-        }
-
-    if not headers_A or not headers_B:
-        raise RuntimeError("No blocks found in blk*.dat")
-
-    # Build chains for both variants
-    hmap_A, main_A, tip_A_hash, tip_A_height, diff1_A = _build_chain_for_headers(headers_A)
-    hmap_B, main_B, tip_B_hash, tip_B_height, diff1_B = _build_chain_for_headers(headers_B)
-
-    print(f"[pass1] Variant A (reversed hashes): tip height {tip_A_height}, tip hash {tip_A_hash}")
-    print(f"[pass1] Variant B (raw little-endian): tip height {tip_B_height}, tip hash {tip_B_hash}")
-
-    # Choose the variant with the higher tip height
-    if tip_A_height >= tip_B_height:
-        USE_REVERSED_HASH = True
-        headers = headers_A
-        height_map = hmap_A
-        main_chain = main_A
-        tip_hash = tip_A_hash
-        tip_height = tip_A_height
-        diff1_target = diff1_A
-        chosen = "A (reversed hashes / Bitcoin-style)"
+    if workers is None or workers <= 1:
+        # Single-process
+        for header80, block_size in iter_block_headers(blocks_dir):
+            header_count += 1
+            if header_count % 10000 == 0:
+                print(f"[pass1]   scanned {header_count} block headers so far...", flush=True)
+            if len(header80) < 80:
+                continue
+            h = parse_block_header_bytes(header80, True)
+            headers[h["hash"]] = {
+                "prev": h["prev_block"],
+                "time": h["time"],
+                "bits": h["bits"],
+                "size": block_size,
+            }
     else:
-        USE_REVERSED_HASH = False
-        headers = headers_B
-        height_map = hmap_B
-        main_chain = main_B
-        tip_hash = tip_B_hash
-        tip_height = tip_B_height
-        diff1_target = diff1_B
-        chosen = "B (raw little-endian hashes)"
-
-    print(f"[pass1] Using variant {chosen}")
+        # Multi-process
+        num_workers = min(max(1, workers), cpu_count() or 1)
+        print(f"[pass1] Using {num_workers} worker processes for header Dcrypt...", flush=True)
+        from multiprocessing import Pool
+        pool = Pool(processes=num_workers)
+        try:
+            for result in pool.imap_unordered(_parse_header_for_pool, iter_block_headers(blocks_dir), chunksize=200):
+                status, bh, prev, t, bits, block_size, err_msg = result
+                header_count += 1
+                if header_count % 10000 == 0:
+                    print(f"[pass1]   scanned {header_count} block headers so far...", flush=True)
+                if status != "ok":
+                    print(f"[warn] Failed to parse header: {err_msg}")
+                    continue
+                headers[bh] = {
+                    "prev": prev,
+                    "time": t,
+                    "bits": bits,
+                    "size": block_size,
+                }
+        finally:
+            pool.close()
+            pool.join()
+    if not headers:
+        raise RuntimeError("No blocks found in blk*.dat")
+    height_map, main_chain, tip_hash, tip_height, diff1_target = _build_chain_for_headers(headers)
+    print(f"[pass1] Main chain tip height {tip_height}, tip hash {tip_hash}")
     print(f"[pass1] Found {len(headers)} blocks in files.")
-
     return headers, height_map, main_chain, tip_hash, tip_height, diff1_target
 
 
 # ----------- import into your DB (pass 2) -----------
 
 
-def import_mainchain_to_db(blocks_dir):
+# Helper for multiprocessing block parsing
+def _parse_block_for_pool(args):
     """
-    Single-pass import:
-      - stream all blocks in file order
-      - parse full blocks
-      - assign block_height sequentially starting at 0
-      - write directly into Explorer DB
-    This deliberately ignores possible side-chain/orphan blocks and treats
-    the blkNNNN.dat sequence as canonical, which is sufficient for the
-    explorer use case.
+    Helper for multiprocessing: parse a single block in a worker process.
+
+    Args:
+        args: tuple (block_bytes, block_size)
+
+    Returns:
+        ("ok", block_dict, block_size, None, header80) on success
+        ("err", None, block_size, error_message, header80) on failure
     """
-    print("[pass2] Importing all blocks sequentially into SQLite...")
+    block_bytes, block_size = args
+    header80 = block_bytes[:80]
+    try:
+        block = parse_full_block(block_bytes)
+        return ("ok", block, block_size, None, header80)
+    except Exception as e:
+        # Return the error message as string so the main process can log it
+        return ("err", None, block_size, str(e), header80)
+
+
+# ----------- post-processing helpers (spent flags & addresses) -----------
+
+BATCH_SIZE_SPENT = 10000  # number of vin rows per batch when rebuilding spent flags
+
+
+def ensure_link_indices(conn):
+    """
+    Ensure we have helper indices to efficiently link vin -> vout.
+    These indices are cheap to create and speed up spent-flag rebuilding.
+    They are kept in addition to the normal explorer indices.
+    """
+    c = conn.cursor()
+    # Index on vin(vout_txid, vout_index)
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_vin_outref "
+        "ON vin(vout_txid, vout_index)"
+    )
+    # Index on vout(txid, ind)
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_vout_outref "
+        "ON vout(txid, ind)"
+    )
+    conn.commit()
+
+
+def rebuild_spent_flags(conn):
+    """
+    Reset and rebuild vout.spent in small batches based on vin.
+
+    Logic:
+      - Set all vout.spent = 0
+      - Iterate over vin rows in rowid order in batches.
+      - For each vin, mark the referenced vout(txid, ind) as spent=1.
+
+    This is designed to be memory-friendly and can be re-run if needed.
+    """
+    c = conn.cursor()
+
+    print("[spent] Ensuring helper indices for vin/vout linking...")
+    ensure_link_indices(conn)
+
+    print("[spent] Resetting all vout.spent to 0...")
+    c.execute("UPDATE vout SET spent = 0")
+    conn.commit()
+
+    print("[spent] Rebuilding spent flags from vin in batches...")
+    last_rowid = 0
+    total_processed = 0
+
+    while True:
+        # Fetch next batch of vin rows
+        c.execute(
+            """
+            SELECT rowid, vout_txid, vout_index
+            FROM vin
+            WHERE rowid > ?
+            ORDER BY rowid
+            LIMIT ?
+            """,
+            (last_rowid, BATCH_SIZE_SPENT),
+        )
+        rows = c.fetchall()
+        if not rows:
+            break
+
+        # Update corresponding vout rows
+        for rowid, vout_txid, vout_index in rows:
+            c.execute(
+                "UPDATE vout SET spent = 1 WHERE txid = ? AND ind = ?",
+                (vout_txid, int(vout_index)),
+            )
+            last_rowid = rowid
+            total_processed += 1
+
+        conn.commit()
+        print(f"[spent] Processed {total_processed} vin rows so far...")
+
+    print(f"[spent] Done. Total vin rows processed: {total_processed}")
+
+
+def run_postprocessing(conn, tip_height: int):
+    """
+    Run all post-import steps on an existing explorer database connection:
+
+      - Update confirmations based on the given tip_height
+      - Rebuild vout.spent flags from vin in a memory-friendly way
+      - Recreate explorer indices
+      - Rebuild the addresses table up to tip_height
+
+    This helper is used both after a fresh import and in post-only mode.
+    """
+    c = conn.cursor()
+
+    # 1) Set confirmations in bulk based on true tip height
+    print("[post] Updating confirmations...")
+    c.execute(
+        "UPDATE blocks SET confirmations = ? - block_height + 1",
+        (int(tip_height),),
+    )
+    conn.commit()
+
+    # 2) Rebuild spent flags from vin in batches
+    print("[post] Rebuilding spent flags from vin...")
+    rebuild_spent_flags(conn)
+
+    # 3) Recreate indices
+    print("[post] Creating indices...")
+    create_indices(conn)
+    conn.commit()
+
+    # 4) Rebuild addresses table from vout
+    print("[post] Rebuilding addresses table...")
+    rebuild_addresses(conn, int(tip_height))
+    print("[done] Post-processing finished.")
+
+
+def import_mainchain_to_db(blocks_dir, workers=1):
+    """
+    Import main-chain blocks into the explorer database.
+
+    Steps:
+      1) First pass: build chain headers, heights, and main-chain set
+         (optionally multi-core, controlled by 'workers')
+      2) Second pass: iterate blk*.dat again, parse blocks
+         - ALWAYS single-process to keep memory usage low
+         - skip orphan/side-chain blocks
+         - insert only main-chain blocks with their true height
+    """
+    # ---------- PASS 1: discover main chain ----------
+    (
+        headers,
+        height_map,
+        main_chain,
+        tip_hash,
+        tip_height,
+        diff1_target,
+    ) = build_chain_headers(blocks_dir, workers=workers)
+
+    print(
+        f"[pass1] Main chain tip height {tip_height}, tip hash {tip_hash}, "
+        f"{len(main_chain)} main-chain blocks out of {len(headers)} total."
+    )
+
+    print("[pass2] Importing main-chain blocks into SQLite (single-process)...")
 
     conn = sqlite3.connect(DATABASE, timeout=10)
     try:
-        # similar performance tuning as in reindex_db
+        # Performance tuning pragmas similar to reindex_db
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA temp_store=MEMORY")
@@ -616,48 +845,57 @@ def import_mainchain_to_db(blocks_dir):
             conn.execute("BEGIN IMMEDIATE")
 
         imported_blocks = 0
-        current_height = 0
-        last_height = -1
-        diff1_target = None
+        seq_index = 0  # sequential position in blk*.dat (for logging only)
 
-        for block_bytes, block_size in iter_block_bytes(blocks_dir):
+        # PASS 2: always single-process, streaming blocks directly from disk
+        block_iter = iter_block_bytes(blocks_dir)
+
+        for block_bytes, block_size in block_iter:
+            header80 = block_bytes[:80]
+
+            # Parse header first to decide whether we care about this block
+            try:
+                hdr = parse_block_header_bytes(header80, USE_REVERSED_HASH)
+            except Exception as e_hdr:
+                print(
+                    f"[warn] Failed to parse header at sequential index {seq_index}: {e_hdr}"
+                )
+                seq_index += 1
+                continue
+
+            bh = hdr["hash"]
+            bits = hdr["bits"]
+            b_time = hdr["time"]
+
+            # Skip orphan / side-chain blocks as early as possible
+            if bh not in main_chain:
+                seq_index += 1
+                continue
+
+            # Now parse full block including transactions
             try:
                 block = parse_full_block(block_bytes)
             except Exception as e:
-                # Try to decode at least the header so we know which block failed
-                try:
-                    hdr = parse_block_header(block_bytes)
-                    bh_fail = hdr["hash"]
-                    btime_fail = hdr["time"]
-                    bits_fail = hdr["bits"]
-                    print(
-                        f"[warn] Failed to parse block at sequential height {current_height}, "
-                        f"hash {bh_fail}, time {btime_fail}, bits {bits_fail}: {e}"
-                    )
-                except Exception as e2:
-                    print(
-                        f"[warn] Failed to parse block at sequential height {current_height}, "
-                        f"and header parsing also failed: {e} / header error: {e2}"
-                    )
+                print(
+                    f"[warn] Failed to parse MAIN-CHAIN block at sequential index {seq_index}, "
+                    f"hash {bh}, time {b_time}, bits {bits}: {e}"
+                )
+                seq_index += 1
                 continue
 
-            bh = block["hash"]
-            b_height = current_height
-            current_height += 1
-            last_height = b_height
+            b_height = height_map[bh]
 
-            b_time = block["time"]
-            bits = block["bits"]
-
-            # initialize diff1_target from the first successfully parsed block
-            if diff1_target is None:
-                exponent = bits >> 24
-                mantissa = bits & 0xFFFFFF
-                diff1_target = mantissa * (1 << (8 * (exponent - 3)))
+            # --- At this point we have a valid MAIN-CHAIN block dict + header info ---
+            # Sanity: ensure block["hash"] matches header hash
+            if block["hash"] != bh:
+                print(
+                    f"[warn] Hash mismatch for main-chain block at height {b_height}: "
+                    f"header {bh} vs block {block['hash']}"
+                )
 
             difficulty = difficulty_from_bits(bits, diff1_target)
 
-            # insert block row
+            # Insert block row
             c.execute(
                 """
                 INSERT OR REPLACE INTO blocks
@@ -682,12 +920,11 @@ def import_mainchain_to_db(blocks_dir):
                 ),
             )
 
-            # insert transactions
+            # Insert transactions
             for tx in block["txs"]:
                 txid = tx["txid"]
                 is_coinbase = tx["is_coinbase"]
 
-                # sum of outputs in SLM units
                 total_amount_slm = 0.0
                 for vout in tx["vout"]:
                     total_amount_slm += vout["value_satoshi"] / COIN
@@ -754,49 +991,21 @@ def import_mainchain_to_db(blocks_dir):
             if imported_blocks % 1000 == 0:
                 conn.commit()
                 conn.execute("BEGIN IMMEDIATE")
-                print(f"[pass2] Imported {imported_blocks} blocks (up to height {b_height})")
+                print(
+                    f"[pass2] Imported {imported_blocks} main-chain blocks "
+                    f"(up to height {b_height})"
+                )
+
+            seq_index += 1
 
         conn.commit()
-
-        tip_height = last_height if last_height >= 0 else 0
 
         if imported_blocks == 0:
-            print("[pass2] No blocks imported.")
+            print("[pass2] No main-chain blocks imported.")
             return tip_height
 
-        # set confirmations in bulk
-        print("[post] Updating confirmations...")
-        c.execute(
-            "UPDATE blocks SET confirmations = ? - block_height + 1",
-            (int(tip_height),),
-        )
-        conn.commit()
-
-        # rebuild spent flags from vin
-        print("[post] Rebuilding spent flags from vin...")
-        c.execute("UPDATE vout SET spent = 0")
-        c.execute(
-            """
-            UPDATE vout
-            SET spent = 1
-            WHERE EXISTS (
-                SELECT 1 FROM vin
-                WHERE vin.vout_txid = vout.txid
-                  AND vin.vout_index = vout.ind
-            )
-            """
-        )
-        conn.commit()
-
-        # recreate indices
-        print("[post] Creating indices...")
-        create_indices(conn)
-        conn.commit()
-
-        # rebuild addresses table from vout
-        print("[post] Rebuilding addresses table...")
-        rebuild_addresses(conn, int(tip_height))
-        print("[done] Import finished.")
+        # Run all post-import steps (confirmations, spent flags, indices, addresses)
+        run_postprocessing(conn, tip_height)
 
         return tip_height
 
@@ -812,13 +1021,26 @@ def main():
     )
     parser.add_argument(
         "--blocks-dir",
-        default=os.path.expanduser("~/.slimcoin/blocks"),
-        help="Directory containing blkNNNN.dat (default: ~/.slimcoin/blocks)",
+        default=os.path.expanduser("~/.slimcoin"),
+        help="Directory containing blkNNNN.dat (default: ~/.slimcoin)",
     )
     parser.add_argument(
         "--reset",
         action="store_true",
         help="Drop & recreate explorer tables before import (like a full reindex).",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of worker processes for header Dcrypt in pass 1 (default: 1). "
+             "Pass 2 (block import) always runs single-process to keep memory usage low.",
+    )
+    parser.add_argument(
+        "--post-only",
+        action="store_true",
+        help="Only run post-processing (confirmations, spent flags, indices, addresses) "
+             "on an existing database. No blk*.dat import.",
     )
     args = parser.parse_args()
 
@@ -826,12 +1048,36 @@ def main():
     if not os.path.isdir(blocks_dir):
         raise SystemExit(f"Blocks directory not found: {blocks_dir}")
 
+    if args.reset and args.post_only:
+        raise SystemExit("--reset and --post-only cannot be used together.")
+
     if args.reset:
         print("[init] Reinitializing tables in", DATABASE)
         reinitialize_tables()
 
-    # Import blocks sequentially; return value (tip_height) is not needed here
-    import_mainchain_to_db(blocks_dir)
+    if args.post_only:
+        # Only run post-processing on an already imported DB
+        print("[init] Post-only mode: running confirmations / spent / indices / addresses...")
+        conn = sqlite3.connect(DATABASE, timeout=10)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA foreign_keys=OFF")
+            conn.execute("PRAGMA busy_timeout=5000")
+
+            cur = conn.cursor()
+            cur.execute("SELECT MAX(block_height) FROM blocks")
+            row = cur.fetchone()
+            tip_height = row[0] if row and row[0] is not None else 0
+            print(f"[post-only] Determined tip height {tip_height} from blocks table.")
+
+            run_postprocessing(conn, int(tip_height))
+        finally:
+            conn.close()
+        return
+
+    # Import blocks; return value (tip_height) is not needed here
+    import_mainchain_to_db(blocks_dir, workers=args.workers)
 
 
 if __name__ == "__main__":
