@@ -6,6 +6,7 @@ Slimcoin blk*.dat -> blockchain.db importer
 - Uses reinitialize_tables(), drop_indices(), create_indices(), rebuild_addresses()
   from database.py
 - Reads Slimcoin raw blocks directly from blkNNNN.dat files
+- Txid hashing: Peercoin/Slimcoin include nTime in the txid when present
 - No RPC, no JSON blocks
 """
 
@@ -157,9 +158,10 @@ def parse_tx(f: BytesIO, allow_time_field: bool):
     - Peercoin-style: version, nTime, vin, vout, locktime
 
     `allow_time_field=True` means we expect an extra 4-byte nTime after the
-    version. The txid is always computed from the canonical Bitcoin-style
-    layout (version, vin, vout, locktime) without the nTime field, to match
-    Slimcoin's/Peercoin's txid semantics.
+    version. **Important:** In Peercoin-derived chains (including Slimcoin),
+    the transaction hash (txid) includes this `nTime` field. Therefore, if
+    `nTime` is present we serialize it between `version` and the vin list
+    when computing the txid.
     """
     tx_start = f.tell()
 
@@ -211,10 +213,13 @@ def parse_tx(f: BytesIO, allow_time_field: bool):
     locktime = read_u32(f, "tx.locktime")
     tx_end = f.tell()
 
-    # Reconstruct canonical bytes for txid hashing (without nTime)
+    # Reconstruct bytes for txid hashing:
+    # Peercoin/Slimcoin semantics: if nTime is present, include it in the hash
     from io import BytesIO as _BytesIO
     buf = _BytesIO()
     buf.write(struct.pack("<I", v))
+    if n_time is not None:
+        buf.write(struct.pack("<I", n_time))
     buf.write(write_varint(vin_count))
     for vin in vins:
         buf.write(bytes.fromhex(vin["prev_txid"])[::-1])
@@ -367,13 +372,16 @@ def parse_block_transactions(block_bytes: bytes, expected_merkle: str):
     best_txs = None
     best_remaining = None
 
-    # Candidate offsets up to 256 bytes; normal blocks succeed at skip=0.
-    max_skip = min(256, len(body))
+    # Candidate offsets up to 2048 bytes; normal blocks succeed at skip=0.
+    max_skip = min(2048, len(body))
     for skip in range(0, max_skip + 1):
         for allow_time in (True, False):
             f = BytesIO(body[skip:])
             try:
                 tx_count = read_varint(f)
+                # basic sanity guard: Slimcoin blocks never have anywhere close to this
+                if tx_count > 20000:
+                    continue
                 txs = []
                 for tx_index in range(tx_count):
                     tx, _ = parse_tx(f, allow_time_field=allow_time)
