@@ -100,15 +100,26 @@ def dcrypt_pow_hash(header80: bytes) -> bytes:
     """
     if len(header80) != 80:
         raise ValueError(f"Expected 80-byte header, got {len(header80)} bytes")
-    h_hex = dcrypt(header80)           # 64 ASCII hex chars
-    return bytes.fromhex(h_hex)        # 32 raw bytes
+
+    # dcrypt() returns 64 ASCII hex characters as bytes
+    h_hex_bytes = dcrypt(header80)
+    if isinstance(h_hex_bytes, bytes):
+        h_hex_str = h_hex_bytes.decode("ascii")
+    else:
+        # Fallback in case dcrypt() is ever changed to return a str
+        h_hex_str = h_hex_bytes
+
+    return bytes.fromhex(h_hex_str)  # 32 raw bytes
 
 
 def dcrypt_pow_hash_hex(header80: bytes) -> str:
     """
     Return Dcrypt PoW hash of header as 64-char hex string.
     """
-    return dcrypt(header80).decode("ascii")
+    h_hex_bytes = dcrypt(header80)
+    if isinstance(h_hex_bytes, bytes):
+        return h_hex_bytes.decode("ascii")
+    return h_hex_bytes
 
 
 def dcrypt_pow_hash_hex_reversed(header80: bytes) -> str:
@@ -128,4 +139,4 @@ if __name__ == "__main__":
     print("test2:", dcrypt_hex(s2))
     # expected (from whitepaper)
     print("exp1 : a74369ea2f6434aa55e38820d35300ba6130d82e0121ef64de6218c9198a377d")
-    print("exp2 : 559c1114f4e9de3bb12e0d1681258503c929f84527936b9d83f7c4d32a4fa67c")
+    print("exp2 : 559c1114f4e9de3bb12e0d1681258503c929f84527936b9d83f7c4d32a4fa67")
