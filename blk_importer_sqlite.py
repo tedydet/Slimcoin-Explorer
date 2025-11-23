@@ -809,6 +809,39 @@ def rebuild_spent_flags(conn):
     print(f"[spent] Done. Total vin rows processed: {total_processed}")
 
 
+ # --- de-duplicate helpers -----------------------------------------------------
+
+def dedupe_vout(conn):
+    """Remove duplicate rows from vout based on the (txid, ind) pair.
+    Keeps the lowest rowid per pair. Necessary because during bulk import we
+    temporarily drop indices; without a UNIQUE constraint, duplicates could be
+    inserted and later cause the UNIQUE index creation to fail.
+    """
+    c = conn.cursor()
+    # Measure before
+    c.execute("SELECT COUNT(*) FROM vout")
+    total_before = c.fetchone()[0]
+
+    # Delete all duplicates, keeping the first (smallest rowid)
+    c.execute(
+        """
+        DELETE FROM vout
+        WHERE rowid NOT IN (
+            SELECT MIN(rowid)
+            FROM vout
+            GROUP BY txid, ind
+        )
+        """
+    )
+    conn.commit()
+
+    # Report after
+    c.execute("SELECT COUNT(*) FROM vout")
+    total_after = c.fetchone()[0]
+    removed = max(0, int(total_before) - int(total_after))
+    print(f"[post] De-duplicated vout: removed {removed} rows (now {total_after}).")
+
+
 def run_postprocessing(conn, tip_height: int):
     """
     Run all post-import steps on an existing explorer database connection:
@@ -834,12 +867,16 @@ def run_postprocessing(conn, tip_height: int):
     print("[post] Rebuilding spent flags from vin...")
     rebuild_spent_flags(conn)
 
-    # 3) Recreate indices
+    # 3) Ensure no duplicate (txid, ind) before creating UNIQUE index
+    print("[post] De-duplicating vout (txid, ind) before creating indices...")
+    dedupe_vout(conn)
+
+    # 4) Recreate indices
     print("[post] Creating indices...")
     create_indices(conn)
     conn.commit()
 
-    # 4) Rebuild addresses table from vout
+    # 5) Rebuild addresses table from vout
     print("[post] Rebuilding addresses table...")
     rebuild_addresses(conn, int(tip_height))
     print("[done] Post-processing finished.")
@@ -885,6 +922,18 @@ def import_mainchain_to_db(blocks_dir, workers=1):
         conn.execute("PRAGMA busy_timeout=5000")
 
         drop_indices(conn)
+
+        # Enforce (txid, ind) uniqueness during import to prevent duplicates
+        print("[pass2] Ensuring UNIQUE(vout.txid, vout.ind) during import...")
+        try:
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_vout_txn ON vout(txid, ind)")
+        except sqlite3.IntegrityError:
+            # If duplicates already exist from a previous partial run, clean them once
+            print("[pass2] Detected pre-existing duplicates in vout; de-duplicating once...")
+            dedupe_vout(conn)
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_vout_txn ON vout(txid, ind)")
+        conn.commit()
+
         c = conn.cursor()
 
         if not conn.in_transaction:
@@ -893,7 +942,7 @@ def import_mainchain_to_db(blocks_dir, workers=1):
         imported_blocks = 0
         seq_index = 0  # sequential position in blk*.dat (for logging only)
 
-        # PASS 2: always single-process, streaming blocks directly from disk
+        # PASS 3: always single-process, streaming blocks directly from disk
         block_iter = iter_block_bytes(blocks_dir)
 
         for block_bytes, block_size in block_iter:
