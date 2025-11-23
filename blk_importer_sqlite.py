@@ -37,8 +37,8 @@ from database import (
 # Slimcoin mainnet magic (pchMessageStart)
 NETWORK_MAGIC = b"\x6e\x8b\x92\xa5"
 
-# Slimcoin uses 10^8 units per coin (like Bitcoin)
-COIN = 100_000_000
+# Slimcoin/Peercoin family uses 10^6 base units per coin (6 decimals).
+COIN = 1_000_000
 
 # Base58 alphabet (Bitcoin-style)
 B58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
