@@ -34,39 +34,51 @@ PEERS = 'peers.db'
 
 
 def get_db_connection():
-    conn = sqlite3.connect(DATABASE)
+    # Open SQLite in read-only mode with shared page cache for faster concurrent reads
+    # Note: write operations are performed by the importer; the web app only reads.
+    uri = f"file:{DATABASE}?mode=ro&amp;cache=shared"
+    conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    # Light SQLite tuning: improves read performance and reduces first-hit latency
+    # Light SQLite tuning (no-ops on read-only where unsupported)
     try:
-        conn.execute('PRAGMA journal_mode=WAL;')
         conn.execute('PRAGMA synchronous=NORMAL;')
         conn.execute('PRAGMA temp_store=MEMORY;')
-        conn.execute('PRAGMA cache_size=-20000;')  # ~20 MB page cache; adjust for device RAM
+        conn.execute('PRAGMA cache_size=-20000;')   # ~20 MB page cache (negative = KB)
+        conn.execute('PRAGMA mmap_size=134217728;') # 128 MB mmap
     except Exception:
         pass
     return conn
 
 
-def get_blocks():
+def get_blocks(limit=20, offset=0):
     conn = get_db_connection()
     c = conn.cursor()
+    # Only fetch the most recent N blocks, then aggregate per block
     c.execute("""
-        SELECT 
-            b.block_height,
-            b.block_hash,
-            b.timestamp,
-            b.flags,
-            b.effective_burn_coins,
-            b.mint,
-            b.burnt,
-            IFNULL(SUM(t.amount), 0) as total_amount
-        FROM blocks b
-        LEFT JOIN transactions t ON b.block_hash = t.block_hash
-        GROUP BY 
-            b.block_height, b.block_hash, b.timestamp,
-            b.flags, b.effective_burn_coins, b.mint, b.burnt
-        ORDER BY b.block_height DESC
-    """)
+        WITH latest AS (
+            SELECT block_height, block_hash, timestamp, flags,
+                   effective_burn_coins, mint, burnt
+            FROM blocks
+            ORDER BY block_height DESC
+            LIMIT ? OFFSET ?
+        )
+        SELECT
+            l.block_height,
+            l.block_hash,
+            l.timestamp,
+            l.flags,
+            l.effective_burn_coins,
+            l.mint,
+            l.burnt,
+            IFNULL(SUM(t.amount), 0) AS total_amount
+        FROM latest l
+        LEFT JOIN transactions t
+          ON t.block_hash = l.block_hash
+        GROUP BY
+            l.block_height, l.block_hash, l.timestamp,
+            l.flags, l.effective_burn_coins, l.mint, l.burnt
+        ORDER BY l.block_height DESC
+    """, (limit, offset))
     blocks_raw = c.fetchall()
     blocks = [
         {
@@ -113,7 +125,8 @@ def get_block_detail(block_hash):
 
 @app.route('/')
 def index():
-    blocks = get_blocks()
+    # Render only a small recent window on first load to prevent full-table scans
+    blocks = get_blocks(limit=20)
     return render_template('index.html', blocks=blocks)
 
 
@@ -424,6 +437,7 @@ def get_hash_rate(num_pow_blocks=20, use_target=False, target_pow_seconds=None):
 
 
 @app.route('/blockchain-stats')
+@cache.cached(timeout=60)
 def blockchain_stats():
     total_supply = calculate_total_supply()
     current_difficulty = get_current_difficulty()
@@ -438,6 +452,7 @@ def blockchain_stats():
 
 
 @app.route('/consensus-stats')
+@cache.cached(timeout=60)
 def consensus_stats():
     total_supply = calculate_total_supply() + get_total_burnt()
     current_difficulty = get_current_difficulty()
@@ -502,6 +517,7 @@ def search():
 
 
 @app.route('/richlist')
+@cache.cached(timeout=120)
 def rich_list():
     conn = get_db_connection()
     c = conn.cursor()
@@ -687,42 +703,6 @@ def consensus_stats_api():
     return jsonify(stats)
 
 
-# Warmup to prefill caches once (Flask >= 3 compatible)
-_did_warm = False
-_warm_lock = Lock()
-
-
-def _do_warm():
-    # Call view functions inside a request context so @cache.cached greift
-    with app.app_context():
-        with app.test_request_context('/'):
-            try:
-                blocks_frame(page=1)
-                rich_list()
-                blockchain_stats()
-                consensus_stats()
-            except Exception as e:
-                app.logger.warning(f"warmup failed: {e}")
-
-
-@app.before_request
-def _maybe_warm_caches():
-    # Start once per process; Lock prevents race conditions
-    global _did_warm
-    if not _did_warm:
-        with _warm_lock:
-            if not _did_warm:
-                _do_warm()
-                _did_warm = True
-
-
-# optional: pre-warm in the background immediately after import,
-# so that the very first request renders faster.
-try:
-    import threading
-    threading.Thread(target=_do_warm, daemon=True).start()
-except Exception as e:
-    app.logger.warning(f"background warmup thread failed: {e}")
 
 if __name__ == '__main__':
     app.run(debug=False)
