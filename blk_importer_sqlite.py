@@ -45,6 +45,10 @@ B58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 # Slimcoin P2PKH address prefix (0x3f -> addresses starting with "S")
 P2PKH_PREFIX = 0x3F
+# Addresses that must be excluded from circulating metrics (burn sinks, etc.)
+BURN_ADDRESSES = {
+    "SfSLMCoinMainNetworkBurnAddr1DeTK5",
+}
 
 # Global: controls how we interpret block header hashes / prev-hashes.
 # True  -> Bitcoin-style: double-SHA256(header)[::-1].hex(), prev_hash bytes[::-1].hex()
@@ -879,6 +883,13 @@ def run_postprocessing(conn, tip_height: int):
     # 5) Rebuild addresses table from vout
     print("[post] Rebuilding addresses table...")
     rebuild_addresses(conn, int(tip_height))
+    # Remove NULL/empty and known burn addresses from the aggregated addresses table
+    print("[post] Removing NULL/empty and burn addresses from addresses table...")
+    c.execute("DELETE FROM addresses WHERE address IS NULL OR address=''")
+    if BURN_ADDRESSES:
+        qmarks = ",".join("?" * len(BURN_ADDRESSES))
+        c.execute(f"DELETE FROM addresses WHERE address IN ({qmarks})", tuple(BURN_ADDRESSES))
+    conn.commit()
     print("[done] Post-processing finished.")
 
 
@@ -1044,7 +1055,8 @@ def import_mainchain_to_db(blocks_dir, workers=1):
                     vout_index = vout["n"]
                     value_slm = vout["value_satoshi"] / COIN
                     pk_script = vout["pk_script"]
-                    address = extract_address_from_pk_script(pk_script) or ""
+                    addr = extract_address_from_pk_script(pk_script)
+                    address = addr if addr else None  # store NULL for non-standard scripts so they don't aggregate into a fake "empty" wallet
 
                     c.execute(
                         """
