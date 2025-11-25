@@ -825,10 +825,17 @@ def replace_transaction_in_db(tx, block_height, block_hash, time, conn, do_addre
             if vout_details:
                 if do_address_updates:
                     update_address_in_db(vout_details[0], 0, vout_details[1], block_height, conn)
+    except sqlite3.IntegrityError as e:
+        # Propagate duplicate-key errors so the caller can handle reorgs/rewinds.
+        c.close()
+        raise
     except Exception as e:
         print(f"Failed to insert transaction data into database: {e}")
     finally:
-        c.close()
+        try:
+            c.close()
+        except Exception:
+            pass
 
 
 def rebuild_addresses(conn, current_block_height):
@@ -1243,17 +1250,33 @@ def update_with_latest_block():
                             c.execute('SELECT block_hash FROM blocks WHERE block_height = ?', (block_height - 1,))
                             previous_hash = c.fetchone()
                             if previous_hash and previous_hash[0] != block_info['previousblockhash']:
-                                print(f"Detected a block chain discontinuity at {block_height}, attempting to fix.")
-                                block_height = max(0, block_height - 3)
+                                rewind = int(os.getenv("INCR_REWIND_ON_REORG", "10"))
+                                purge_from = max(1, block_height - rewind)
+                                print(f"Detected a block chain discontinuity at {block_height}, purging from {purge_from} and retrying.")
+                                _purge_from_height(conn, purge_from)
+                                # Persist purge, then restart from purge_from
+                                conn.commit()
+                                block_height = purge_from
                                 continue
 
                         replace_block_in_db(block_info, current_block_height, conn)
                         time_epoch = _normalize_block_time(block_info.get('time'))
-                        for tx_id in block_info.get('tx', []):
-                            decoded_tx = getrawtransaction(tx_id, verbose=True)
-                            if not decoded_tx:
-                                continue
-                            replace_transaction_in_db(decoded_tx, block_height, block_hash, time_epoch, conn)
+                        try:
+                            for tx_id in block_info.get('tx', []):
+                                decoded_tx = getrawtransaction(tx_id, verbose=True)
+                                if not decoded_tx:
+                                    continue
+                                replace_transaction_in_db(decoded_tx, block_height, block_hash, time_epoch, conn)
+                        except sqlite3.IntegrityError as e:
+                            # Likely a reorg: a txid already exists tied to a different block.
+                            rewind = int(os.getenv("INCR_REWIND_ON_DUP", "10"))
+                            purge_from = max(1, block_height - rewind)
+                            print(f"Unique constraint during tx import at height {block_height}: {e}. Purging from {purge_from} and retrying.")
+                            _purge_from_height(conn, purge_from)
+                            conn.commit()
+                            # restart from purge_from
+                            block_height = purge_from
+                            continue
                         # Commit progress periodically (or every block by default)
                         if INCR_COMMIT_EVERY <= 1 or (block_height % INCR_COMMIT_EVERY == 0):
                             try:
