@@ -628,29 +628,56 @@ def replace_block_in_db(_block_info, current_height, conn):
     c.close()
 
 
-def update_peers():
-    # Connect to database
-    getpeerinfo = get_peers()
-    conn = sqlite3.connect(PEERS, timeout=5)
-    c = conn.cursor()
+def update_peers(max_peers: int = 200) -> int:
+    """
+    Fetch peer list via RPC and persist to peers.db (table 'peers').
+    Robust against RPC failures and missing fields.
 
-    # Create Table in case it doesn't exist.
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS peers (
-            peer_ip TEXT NOT NULL UNIQUE)
-    ''')
+    Returns:
+        int: number of peer rows inserted (0 if skipped or on error).
+    """
+    # 1) Try to get peers from the node
+    peers = get_peers()
+    if not isinstance(peers, list):
+        # RPC failed or returned unexpected shape — keep existing DB content
+        print("update_peers: getpeerinfo RPC returned no data; skipping peers update.")
+        return 0
 
-    # Delete old peer data to keep the table up-to-date
-    c.execute('DELETE FROM peers')
+    # 2) Normalize & deduplicate addresses
+    rows = []
+    seen = set()
+    for p in peers[:max_peers]:
+        # Defensive: each item should be a dict
+        if not isinstance(p, dict):
+            continue
+        addr = p.get("addr") or p.get("addrlocal") or p.get("addrbind")
+        if not addr:
+            continue
+        if addr in seen:
+            continue
+        seen.add(addr)
+        rows.append((addr,))
 
-    # Add new peer data
-    peer_ips = [(peer['addr'],) for peer in getpeerinfo]
-    print(peer_ips)
-    c.executemany('INSERT INTO peers (peer_ip) VALUES (?)', peer_ips)
-
-    # Save database changes and close connection
-    conn.commit()
-    conn.close()
+    # 3) Write to DB (fail-safe)
+    try:
+        with sqlite3.connect(PEERS, timeout=5) as conn:
+            c = conn.cursor()
+            c.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS peers (
+                    peer_ip TEXT NOT NULL UNIQUE
+                )
+                '''
+            )
+            # Replace content atomically
+            c.execute('DELETE FROM peers')
+            if rows:
+                c.executemany('INSERT OR IGNORE INTO peers (peer_ip) VALUES (?)', rows)
+            conn.commit()
+            return len(rows)
+    except Exception as e:
+        print(f"update_peers: DB error: {e}")
+        return 0
 
 
 def update_address_in_db(address, received, sent, current_block_height, conn):
@@ -691,36 +718,56 @@ def update_address_in_db(address, received, sent, current_block_height, conn):
 
 
 def update_all_addresses(current_block_height):
+    """
+    Recompute per-address balances and totals from vout with a robust UPSERT.
+
+    - Avoids 'NoneType' errors by never indexing fetchone() when it's None.
+    - Inserts a new row for an address if it's missing (UPSERT), otherwise updates.
+    - Computes (total_received, balance, total_sent) in one pass per address.
+    """
     with sqlite3.connect(DATABASE, timeout=5) as conn:
         c = conn.cursor()
         try:
-            # Call all addresses
-            c.execute('SELECT DISTINCT address FROM vout WHERE spent = 0')
-            addresses = c.fetchall()
+            # Ensure schema exists
+            ensure_tables_exist(conn)
 
-            # Update every single address
-            for (address,) in addresses:
-                # Retrieve all unused transaction outputs (UTXOs) of the address
-                c.execute('''
-                    SELECT amount, created_block_height FROM vout
-                    WHERE address = ? AND spent = 0
-                ''', (address,))
-                vouts = c.fetchall()
+            # Consider all addresses that ever appeared in vout (spent or unspent)
+            c.execute('SELECT DISTINCT address FROM vout')
+            addr_rows = c.fetchall()
+            addresses = [row[0] for row in addr_rows if row and row[0]]
 
-                new_balance = Decimal(0)
-                for amount, created_block_height in vouts:
-                    amount = Decimal(amount)
-                    new_balance += amount
-
-                # Retrieve the current last update
-                c.execute('SELECT last_updated FROM addresses WHERE address = ?', (address,))
-                last_updated = c.fetchone()[0]
-
-                # Update the address in the database
+            for address in addresses:
+                # Compute totals in a single query:
+                # total_received = SUM(all outputs to this address)
+                # balance        = SUM(unspent outputs to this address)
                 c.execute(
-                    'UPDATE addresses SET balance = ?, last_updated = ? WHERE address = ?',
-                    (str(new_balance), current_block_height, address))
-                print(f"Updated {address} from {last_updated} to: {new_balance}")
+                    '''
+                    SELECT
+                        IFNULL(SUM(amount), 0),
+                        IFNULL(SUM(CASE WHEN spent = 0 THEN amount ELSE 0 END), 0)
+                    FROM vout
+                    WHERE address = ?
+                    ''',
+                    (address,)
+                )
+                row = c.fetchone()
+                total_received = Decimal(row[0]) if row and row[0] is not None else Decimal(0)
+                balance = Decimal(row[1]) if row and row[1] is not None else Decimal(0)
+                total_sent = total_received - balance
+
+                # Upsert row (create if missing, otherwise update)
+                c.execute(
+                    '''
+                    INSERT INTO addresses (address, total_received, total_sent, balance, last_updated)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(address) DO UPDATE SET
+                        total_received = excluded.total_received,
+                        total_sent     = excluded.total_sent,
+                        balance        = excluded.balance,
+                        last_updated   = excluded.last_updated
+                    ''',
+                    (address, str(total_received), str(total_sent), str(balance), current_block_height)
+                )
 
             conn.commit()
         except Exception as e:
