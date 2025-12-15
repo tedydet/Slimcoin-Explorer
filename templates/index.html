@@ -6,24 +6,27 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
 </head>
 <body>
+    <div id="loading-overlay">
+        <div class="spinner"></div>
+    </div>
     <div class="header">
-        <form action="/search" method="get" target="contentFrame">
+        <form action="/search" method="get" target="contentFrame" onsubmit="showLoading()">
             <input type="text" name="query" placeholder="Search by Address, Block, Tx ID...">
             <button type="submit">Search</button>
         </form>
     </div>
     <div class="sidebar">
         <img src="{{ url_for('static', filename='images/logo.png') }}" alt="Logo" style="display: block; margin: 0 auto 20px;">
-        <button onclick="window.frames['contentFrame'].location.href='{{ url_for('blocks_frame') }}'">
+        <button onclick="showLoading(); window.frames['contentFrame'].location.href='{{ url_for('blocks_frame') }}'">
             🌐 Explorer
         </button>
-        <button onclick="window.frames['contentFrame'].location.href='{{ url_for('network') }}'">
+        <button onclick="showLoading(); window.frames['contentFrame'].location.href='{{ url_for('network') }}'">
             📡 Network
         </button>
-        <button onclick="window.frames['contentFrame'].location.href='{{ url_for('rich_list') }}'">
+        <button onclick="showLoading(); window.frames['contentFrame'].location.href='{{ url_for('rich_list') }}'">
             💰 Rich List
         </button>
-        <button onclick="window.frames['contentFrame'].location.href='{{ url_for('consensus_stats') }}'">
+        <button onclick="showLoading(); window.frames['contentFrame'].location.href='{{ url_for('consensus_stats') }}'">
             📊 Stats
         </button>
     </div>
@@ -31,7 +34,25 @@
         <iframe name="statsFrame" src="{{ url_for('stats_frame') }}"></iframe>
     </div>
     <div class="main-content">
-        <iframe name="contentFrame" src="{{ url_for('blocks_frame') }}"></iframe>
+        <iframe id="contentFrame" name="contentFrame" src="{{ url_for('blocks_frame') }}" onload="hideLoading()"></iframe>
     </div>
+<script>
+    function showLoading() {
+        var overlay = document.getElementById('loading-overlay');
+        if (overlay) {
+            overlay.style.display = 'flex';
+        }
+    }
+    function hideLoading() {
+        var overlay = document.getElementById('loading-overlay');
+        if (overlay) {
+            overlay.style.display = 'none';
+        }
+    }
+    // Hide the spinner on initial load of the page
+    window.addEventListener('load', function () {
+        hideLoading();
+    });
+</script>
 </body>
 </html>
