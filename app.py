@@ -397,60 +397,33 @@ def transaction_detail(txid):
 
 @app.route('/address/<address>')
 @app.route('/address/<address>/<int:page>')
+@cache.cached(timeout=60, query_string=True)
 def address_detail(address, page=1):
     per_page = 50
     offset = (page - 1) * per_page
     conn = get_db_connection()
     c = conn.cursor()
 
-    # Query the address totals
+    # Use the precomputed address aggregates if available
     c.execute("""
-            SELECT SUM(amount) AS total_received
-            FROM vout
-            WHERE address = ?
-        """, (address,))
-    total_received = c.fetchone()[0]
+        SELECT total_received, total_sent, balance
+        FROM addresses
+        WHERE address = ?
+    """, (address,))
+    addr_row = c.fetchone()
+    if addr_row:
+        total_received = float(addr_row['total_received'] or 0)
+        total_sent = float(addr_row['total_sent'] or 0)
+        balance = float(addr_row['balance'] or 0)
+    else:
+        # Fallback for very new or missing addresses
+        total_received = 0.0
+        total_sent = 0.0
+        balance = 0.0
 
+    # Single query to get paginated transactions + total count using a window function
     c.execute("""
-            SELECT SUM(v.amount) AS total_sent
-            FROM vin i
-            JOIN vout v ON i.vout_txid = v.txid AND i.vout_index = v.ind
-            WHERE v.address = ?
-        """, (address,))
-    total_sent = c.fetchone()[0]
-
-    c.execute("""
-            SELECT balance
-            FROM addresses
-            WHERE address = ?
-        """, (address,))
-    row = c.fetchone()
-    balance = row['balance'] if row else 0
-
-    # Calculation of the total number of transactions and pages
-    c.execute("""
-        SELECT COUNT(*) FROM (
-            SELECT t.txid
-            FROM vout v
-            JOIN transactions t ON v.txid = t.txid
-            WHERE v.address = ?
-            GROUP BY t.txid
-            UNION ALL
-            SELECT i.txid
-            FROM vin i
-            JOIN vout v ON i.vout_txid = v.txid AND i.vout_index = v.ind
-            JOIN transactions t ON i.txid = t.txid
-            WHERE v.address = ? AND t.is_coinbase = 0
-            GROUP BY i.txid
-        ) AS combined
-    """, (address, address))
-    total_transactions = c.fetchone()[0]
-    total_pages = (total_transactions + per_page - 1) // per_page
-
-    # Paginated query of the transactions
-    c.execute("""
-        SELECT txid, SUM(amount) AS total_amount, block_hash, MAX(timestamp) AS timestamp, type
-        FROM (
+        WITH combined AS (
             SELECT t.txid, v.amount, v.block_hash, t.timestamp, 'received' AS type
             FROM vout v
             JOIN transactions t ON v.txid = t.txid
@@ -461,11 +434,37 @@ def address_detail(address, page=1):
             JOIN vout v ON i.vout_txid = v.txid AND i.vout_index = v.ind
             JOIN transactions t ON i.txid = t.txid
             WHERE v.address = ? AND t.is_coinbase = 0
-        ) AS combined
-        GROUP BY txid, type
-        ORDER BY MAX(timestamp) DESC
+        ),
+        grouped AS (
+            SELECT
+                txid,
+                SUM(amount) AS total_amount,
+                MAX(block_hash) AS block_hash,
+                MAX(timestamp) AS timestamp,
+                type
+            FROM combined
+            GROUP BY txid, type
+        )
+        SELECT
+            txid,
+            total_amount,
+            block_hash,
+            timestamp,
+            type,
+            COUNT(*) OVER() AS total_rows
+        FROM grouped
+        ORDER BY timestamp DESC
         LIMIT ? OFFSET ?
     """, (address, address, per_page, offset))
+    rows = c.fetchall()
+
+    if rows:
+        total_transactions = rows[0]['total_rows']
+    else:
+        total_transactions = 0
+
+    total_pages = (total_transactions + per_page - 1) // per_page if total_transactions > 0 else 1
+
     transactions = [{
         'txid': tx['txid'],
         'amount': float(tx['total_amount'] or 0),
@@ -473,14 +472,22 @@ def address_detail(address, page=1):
         'timestamp': (datetime.fromtimestamp(tx['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
                       if tx['timestamp'] is not None else 'unknown'),
         'type': tx['type']
-    } for tx in c.fetchall()]
+    } for tx in rows]
 
     conn.close()
-    return render_template('address_detail.html', address=address, address_details={
-        'total_received': total_received,
-        'total_sent': total_sent,
-        'balance': balance
-    }, transactions=transactions, pages=range(1, total_pages + 1), page=page, total_pages=total_pages)
+    return render_template(
+        'address_detail.html',
+        address=address,
+        address_details={
+            'total_received': total_received,
+            'total_sent': total_sent,
+            'balance': balance
+        },
+        transactions=transactions,
+        pages=range(1, total_pages + 1),
+        page=page,
+        total_pages=total_pages
+    )
 
 
 def paginate(current_page, total_pages, display_pages=5):
