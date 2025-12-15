@@ -317,9 +317,12 @@ def blocks_frame(page=1):
 @app.route('/transaction/<txid>')
 @cache.cached(timeout=30)
 def transaction_detail(txid):
+    # Normalize txid once to match DB storage (hex string, usually lowercase)
+    norm_txid = txid.lower()
     conn = get_db_connection()
     c = conn.cursor()
-    # Fetch the core transaction and its block metadata in a single query
+    # Fetch the core transaction and its block metadata in a single query.
+    # Avoid LOWER() on the column so SQLite can use the txid index.
     c.execute("""
         SELECT
             tx.txid,
@@ -332,8 +335,8 @@ def transaction_detail(txid):
             b.effective_burn_coins
         FROM transactions tx
         LEFT JOIN blocks b ON tx.block_hash = b.block_hash
-        WHERE LOWER(tx.txid) = LOWER(?)
-    """, (txid,))
+        WHERE tx.txid = ?
+    """, (norm_txid,))
     transaction_row = c.fetchone()
 
     if not transaction_row:
@@ -354,7 +357,7 @@ def transaction_detail(txid):
         FROM vout
         WHERE vout.txid = ?
         GROUP BY vout.address
-    """, (txid,))
+    """, (norm_txid,))
     outputs = [{'recipient': row['recipient'], 'amount': row['amount']} for row in c.fetchall()]
 
     # Inputs (grouped by sender address via previous outputs)
@@ -369,7 +372,7 @@ def transaction_detail(txid):
             JOIN vout ON vin.vout_txid = vout.txid AND vin.vout_index = vout.ind
             WHERE vin.txid = ?
             GROUP BY vout.address
-        """, (txid,))
+        """, (norm_txid,))
         inputs = [{'sender': row['sender'], 'amount': row['amount']} for row in c.fetchall()]
 
     conn.close()
@@ -677,16 +680,19 @@ def search_block_by_index(index):
 
 
 def search_block_by_hash(hash):
+    norm_hash = hash.lower()
     with sqlite3.connect(DATABASE) as conn:
         c = conn.cursor()
-        c.execute('SELECT * FROM blocks WHERE LOWER(block_hash) = LOWER(?)', (hash,))
+        c.execute('SELECT * FROM blocks WHERE block_hash = ?', (norm_hash,))
         return c.fetchone()
 
 
 def search_transaction(txid):
+    norm_txid = txid.lower()
     with sqlite3.connect(DATABASE) as conn:
         c = conn.cursor()
-        c.execute('SELECT * FROM transactions WHERE LOWER(txid) = LOWER(?)', (txid,))
+        # Direct equality allows the index on txid to be used.
+        c.execute('SELECT * FROM transactions WHERE txid = ?', (norm_txid,))
         return c.fetchone()
 
 
