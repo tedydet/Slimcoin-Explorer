@@ -70,5 +70,17 @@
         {% endfor %}
     </table>
 </div>
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+    var links = document.querySelectorAll('a[href^="/"]');
+    links.forEach(function (a) {
+        a.addEventListener('click', function () {
+            if (window.parent && typeof window.parent.showLoading === 'function') {
+                window.parent.showLoading();
+            }
+        });
+    });
+});
+</script>
 </body>
 </html>
