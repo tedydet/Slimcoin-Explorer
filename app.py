@@ -123,6 +123,114 @@ def get_block_detail(block_hash):
     conn.close()
     return block_details
 
+
+def get_block_detail_fast(block_hash):
+    with sqlite3.connect(DATABASE, timeout=5) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+
+        # 1) Fetch block
+        c.execute('SELECT * FROM blocks WHERE block_hash = ?', (block_hash,))
+        b = c.fetchone()
+        if not b:
+            return None
+
+        block = dict(b)
+
+        # 2) All TXs from this block
+        c.execute('''
+            SELECT txid, amount, timestamp, is_coinbase
+            FROM transactions
+            WHERE block_hash = ?
+            ORDER BY rowid
+        ''', (block_hash,))
+        tx_rows = c.fetchall()
+        if not tx_rows:
+            block["transactions"] = []
+            return block
+
+        txids = [row["txid"] for row in tx_rows]
+        tx_map = {
+            row["txid"]: {
+                "txid": row["txid"],
+                "amount": row["amount"],
+                "timestamp": row["timestamp"],
+                "is_coinbase": bool(row["is_coinbase"]),
+                "vin": [],
+                "vout": [],
+            }
+            for row in tx_rows
+        }
+
+        # 3) Alle vouts of this TX in one go
+        placeholders = ",".join("?" for _ in txids)
+        c.execute(
+            f'''
+            SELECT txid, ind, amount, address, spent
+            FROM vout
+            WHERE txid IN ({placeholders})
+            ORDER BY txid, ind
+            ''',
+            txids,
+        )
+        for row in c.fetchall():
+            tx = tx_map.get(row["txid"])
+            if not tx:
+                continue
+            tx["vout"].append({
+                "n": row["ind"],
+                "amount": row["amount"],
+                "address": row["address"],
+                "spent": bool(row["spent"]),
+            })
+
+        # 4) All vins from this TX in one go
+        c.execute(
+            f'''
+            SELECT txid, vout_txid, vout_index
+            FROM vin
+            WHERE txid IN ({placeholders})
+            ORDER BY txid, vout_index
+            ''',
+            txids,
+        )
+        vin_rows = c.fetchall()
+
+        # Optional: Resolve inputs directly with address/amount
+        prev_refs = {(r["vout_txid"], r["vout_index"]) for r in vin_rows}
+        inputs_map = {}
+        if prev_refs:
+            prev_txids = list({txid for (txid, _) in prev_refs})
+            placeholders2 = ",".join("?" for _ in prev_txids)
+            c.execute(
+                f'''
+                SELECT txid, ind, amount, address
+                FROM vout
+                WHERE txid IN ({placeholders2})
+                ''',
+                prev_txids,
+            )
+            for row in c.fetchall():
+                inputs_map[(row["txid"], row["ind"])] = {
+                    "address": row["address"],
+                    "amount": row["amount"],
+                }
+
+        for row in vin_rows:
+            tx = tx_map.get(row["txid"])
+            if not tx:
+                continue
+            ref = inputs_map.get((row["vout_txid"], row["vout_index"]), {})
+            tx["vin"].append({
+                "vout_txid": row["vout_txid"],
+                "vout_index": row["vout_index"],
+                "address": ref.get("address"),
+                "amount": ref.get("amount"),
+            })
+
+        block["transactions"] = list(tx_map.values())
+        return block
+
 @app.route('/')
 def index():
     # Render only a small recent window on first load to prevent full-table scans
@@ -137,7 +245,8 @@ def stats_frame():
 
 @app.route('/block/<block_hash>')
 def block_detail(block_hash):
-    block = get_block_detail(block_hash)
+    #block = get_block_detail(block_hash)
+    block = get_block_detail_fast(block_hash)
     if not block:
         return render_template('not_found.html'), 404
     return render_template('block_detail.html', block=block)
