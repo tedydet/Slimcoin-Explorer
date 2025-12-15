@@ -830,6 +830,10 @@ def replace_transaction_in_db(tx, block_height, block_hash, time, conn, do_addre
         c.close()
         raise
     except Exception as e:
+        msg = str(e)
+        if "UNIQUE constraint failed: transactions.txid" in msg:
+            c.close()
+            raise sqlite3.IntegrityError(msg)
         print(f"Failed to insert transaction data into database: {e}")
     finally:
         try:
