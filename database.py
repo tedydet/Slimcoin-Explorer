@@ -1221,6 +1221,14 @@ def reindex_db_continue(rewind: int = CONTINUE_REWIND):
 
 def update_with_latest_block():
     with sqlite3.connect(DATABASE, timeout=5) as conn:
+        # Apply the same performance-related PRAGMAs as in reindex_db to speed up incremental updates
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA synchronous=NORMAL')
+        conn.execute('PRAGMA temp_store=MEMORY')
+        conn.execute('PRAGMA cache_size=-20000')
+        conn.execute('PRAGMA foreign_keys=OFF')
+        conn.execute('PRAGMA busy_timeout=5000')
+
         # Ensure schema exists so we can run without a prior reindex
         ensure_tables_exist(conn)
         c = conn.cursor()
@@ -1298,7 +1306,7 @@ def update_with_latest_block():
                                 print(f"Commit failed at height {block_height} (no block): {e}")
                         block_height += 1
 
-                update_all_addresses(current_block_height)
+                rebuild_addresses(conn, current_block_height)
                 conn.commit()
             else:
                 print("No new blocks to add.")
