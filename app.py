@@ -358,14 +358,19 @@ def transaction_detail(txid):
     outputs = [{'recipient': row['recipient'], 'amount': row['amount']} for row in c.fetchall()]
 
     # Inputs (grouped by sender address via previous outputs)
-    c.execute("""
-        SELECT vout.address as sender, SUM(vout.amount) as amount
-        FROM vin
-        JOIN vout ON vin.vout_txid = vout.txid AND vin.vout_index = vout.ind
-        WHERE vin.txid = ?
-        GROUP BY vout.address
-    """, (txid,))
-    inputs = [{'sender': row['sender'], 'amount': row['amount']} for row in c.fetchall()]
+    # For coinbase / reward transactions there are no real inputs in vin,
+    # so we can skip the (potentially expensive) lookup entirely.
+    if transaction.get('is_coinbase'):
+        inputs = []
+    else:
+        c.execute("""
+            SELECT vout.address as sender, SUM(vout.amount) as amount
+            FROM vin
+            JOIN vout ON vin.vout_txid = vout.txid AND vin.vout_index = vout.ind
+            WHERE vin.txid = ?
+            GROUP BY vout.address
+        """, (txid,))
+        inputs = [{'sender': row['sender'], 'amount': row['amount']} for row in c.fetchall()]
 
     conn.close()
 
