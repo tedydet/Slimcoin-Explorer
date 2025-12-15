@@ -556,7 +556,7 @@ def get_hash_rate(num_pow_blocks=20, use_target=False, target_pow_seconds=None):
 
 
 @app.route('/blockchain-stats')
-@cache.cached(timeout=60)
+@cache.cached(timeout=300)
 def blockchain_stats():
     total_supply = calculate_total_supply()
     current_difficulty = get_current_difficulty()
@@ -571,7 +571,7 @@ def blockchain_stats():
 
 
 @app.route('/consensus-stats')
-@cache.cached(timeout=60)
+@cache.cached(timeout=300)
 def consensus_stats():
     total_supply = calculate_total_supply() + get_total_burnt()
     current_difficulty = get_current_difficulty()
@@ -636,22 +636,23 @@ def search():
 
 
 @app.route('/richlist')
-@cache.cached(timeout=120)
+@cache.cached(timeout=600)
 def rich_list():
     conn = get_db_connection()
     c = conn.cursor()
 
-    # Circulating Supply (minted – burnt) als Basis für Prozentwerte
+    # Circulating Supply (minted – burnt) as basis for the percentage
     total_supply = calculate_total_supply()
 
+    # Use balance directly so the index on addresses(balance) can be used for WHERE and ORDER BY.
     c.execute("""
         SELECT
             address,
-            COALESCE(balance, 0) AS total_amount,
-            (COALESCE(balance, 0) * 1.0 / ? * 100.0) AS percentage
+            balance AS total_amount,
+            (balance * 1.0 / ? * 100.0) AS percentage
         FROM addresses
-        WHERE COALESCE(balance, 0) > 0
-        ORDER BY total_amount DESC, address ASC
+        WHERE balance > 0
+        ORDER BY balance DESC, address ASC
         LIMIT 100
     """, (total_supply or 1.0,))
     wallets = c.fetchall()

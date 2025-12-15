@@ -1331,23 +1331,37 @@ def calculate_total_supply():
         total_supply = SUM(mint) - burnt_at_tip
     where 'burnt' is a cumulative value stored on the latest block (chain tip).
     Falls back to SUM(addresses.balance) if block metadata is not yet populated.
+    This version uses a single aggregate query for both minted_sum and burnt_cum.
     """
     with sqlite3.connect(DATABASE, timeout=5) as conn:
         c = conn.cursor()
-        # 1) cumulative minted across all blocks
-        c.execute('SELECT SUM(mint) FROM blocks')
+        # Single query to fetch total minted and latest cumulative burnt
+        c.execute("""
+            SELECT
+                IFNULL(SUM(mint), 0) AS minted_sum,
+                (
+                    SELECT burnt
+                    FROM blocks
+                    ORDER BY block_height DESC
+                    LIMIT 1
+                ) AS burnt_cum
+            FROM blocks
+        """)
         row = c.fetchone()
+        if not row:
+            return 0.0
+
         minted_sum = Decimal(row[0] or 0)
-        # 2) cumulative burnt from the latest block (tip)
-        c.execute('SELECT burnt FROM blocks ORDER BY block_height DESC LIMIT 1')
-        row2 = c.fetchone()
-        burnt_cum = Decimal(row2[0] or 0) if row2 else Decimal(0)
+        burnt_cum = Decimal(row[1] or 0)
+
         total = minted_sum - burnt_cum
-        # Fallback if DB not yet indexed
+
+        # Fallback if DB not yet indexed (no meaningful block metadata)
         if minted_sum == 0 and burnt_cum == 0:
             c.execute('SELECT SUM(balance) FROM addresses')
             res = c.fetchone()
             return float(res[0] or 0)
+
         return float(total)
 
 
