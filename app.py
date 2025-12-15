@@ -315,14 +315,24 @@ def blocks_frame(page=1):
 
 
 @app.route('/transaction/<txid>')
+@cache.cached(timeout=30)
 def transaction_detail(txid):
     conn = get_db_connection()
     c = conn.cursor()
+    # Fetch the core transaction and its block metadata in a single query
     c.execute("""
-        SELECT tx.txid, tx.amount, tx.block_hash, b.timestamp, b.confirmations, tx.is_coinbase
+        SELECT
+            tx.txid,
+            tx.amount,
+            tx.block_hash,
+            b.timestamp,
+            b.confirmations,
+            tx.is_coinbase,
+            b.flags,
+            b.effective_burn_coins
         FROM transactions tx
         LEFT JOIN blocks b ON tx.block_hash = b.block_hash
-        WHERE tx.txid = ?
+        WHERE LOWER(tx.txid) = LOWER(?)
     """, (txid,))
     transaction_row = c.fetchone()
 
@@ -338,7 +348,7 @@ def transaction_detail(txid):
     else:
         transaction['timestamp'] = 'unknown'
 
-    # Outputs
+    # Outputs (grouped by recipient address)
     c.execute("""
         SELECT vout.address as recipient, SUM(vout.amount) as amount
         FROM vout
@@ -347,7 +357,7 @@ def transaction_detail(txid):
     """, (txid,))
     outputs = [{'recipient': row['recipient'], 'amount': row['amount']} for row in c.fetchall()]
 
-    # Inputs
+    # Inputs (grouped by sender address via previous outputs)
     c.execute("""
         SELECT vout.address as sender, SUM(vout.amount) as amount
         FROM vin
@@ -361,28 +371,20 @@ def transaction_detail(txid):
 
     mining_status = "Yes" if transaction.get('is_coinbase') else "No"
 
-    reward_flag = None
-    effective_burn_coins = None
-    try:
-        if transaction.get('is_coinbase') and transaction.get('block_hash'):
-            with get_db_connection() as conn2:
-                c2 = conn2.cursor()
-                c2.execute("SELECT flags, effective_burn_coins FROM blocks WHERE LOWER(block_hash) = LOWER(?)",
-                           (transaction['block_hash'],))
-                row = c2.fetchone()
-                if row:
-                    reward_flag = row['flags']
-                    effective_burn_coins = row['effective_burn_coins']
-    except Exception as e:
-        print(f"Warn: could not fetch reward flag for {txid}: {e}")
+    # We already fetched flags and effective_burn_coins with the main query,
+    # so we avoid a second database round-trip.
+    reward_flag = transaction.get('flags')
+    effective_burn_coins = transaction.get('effective_burn_coins')
 
-    return render_template('transaction_detail.html',
-                           transaction=transaction,
-                           outputs=outputs,
-                           inputs=inputs,
-                           mining_status=mining_status,
-                           reward_flag=reward_flag,
-                           effective_burn_coins=float(round(((effective_burn_coins or 0)/1_000_000), 5)))
+    return render_template(
+        'transaction_detail.html',
+        transaction=transaction,
+        outputs=outputs,
+        inputs=inputs,
+        mining_status=mining_status,
+        reward_flag=reward_flag,
+        effective_burn_coins=float(round(((effective_burn_coins or 0) / 1_000_000), 5))
+    )
 
 
 @app.route('/address/<address>')
