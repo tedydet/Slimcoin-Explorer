@@ -2,7 +2,7 @@ from flask import Flask, render_template, request, redirect, url_for, jsonify
 import sqlite3
 from datetime import datetime
 import re
-from database import get_total_burnt, calculate_total_supply
+from database import get_total_burnt, calculate_total_supply, calculate_total_supply_fast
 from threading import Lock
 from werkzeug.middleware.proxy_fix import ProxyFix
 # Flask app setup
@@ -14,9 +14,16 @@ app.config['PREFERRED_URL_SCHEME'] = 'https'
 # Jinja2 bytecode cache to reduce first-render CPU
 from jinja2 import FileSystemBytecodeCache
 import os
+
 app.config['TEMPLATES_AUTO_RELOAD'] = False
-os.makedirs('/tmp/jinja_cache', exist_ok=True)
-app.jinja_env.bytecode_cache = FileSystemBytecodeCache(directory='/tmp/jinja_cache', pattern='slmexp_%s.cache')
+
+JINJA_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.jinja_cache')
+os.makedirs(JINJA_CACHE_DIR, exist_ok=True)
+
+app.jinja_env.bytecode_cache = FileSystemBytecodeCache(
+    directory=JINJA_CACHE_DIR,
+    pattern='slmexp_%s.cache'
+)
 # Lightweight caching for frequently-hit routes (safe fallback if library is missing)
 try:
     from flask_caching import Cache
@@ -565,7 +572,7 @@ def get_hash_rate(num_pow_blocks=20, use_target=False, target_pow_seconds=None):
 @app.route('/blockchain-stats')
 @cache.cached(timeout=300)
 def blockchain_stats():
-    total_supply = calculate_total_supply()
+    total_supply = calculate_total_supply_fast()
     current_difficulty = get_current_difficulty()
     hash_rate = get_hash_rate()
     total_burnt = get_total_burnt()

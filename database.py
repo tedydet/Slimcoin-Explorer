@@ -302,6 +302,18 @@ def getblockcount():
     return _response.get('result')
 
 
+def calculate_total_supply_fast():
+    """
+    Fast total supply estimate for UI views like the rich list.
+    Uses the precomputed address balances instead of scanning all blocks.
+    """
+    with sqlite3.connect(DATABASE, timeout=5) as conn:
+        c = conn.cursor()
+        c.execute('SELECT SUM(balance) FROM addresses')
+        row = c.fetchone()
+        return float(row[0] or 0.0)
+
+
 def get_block_hash(_block_nr):
     _response = rpc_request('getblockhash', [_block_nr])
     if _response.get('error') is not None:
