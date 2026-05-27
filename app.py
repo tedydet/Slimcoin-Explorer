@@ -587,11 +587,14 @@ def blockchain_stats():
 @app.route('/consensus-stats')
 @cache.cached(timeout=300)
 def consensus_stats():
-    total_supply = calculate_total_supply() + get_total_burnt()
+    # Use cached/address-derived circulating supply for performance.
+    # Add burnt to get the minted base used for the burnt percentage denominator.
+    total_burnt = get_total_burnt()
+    total_supply = calculate_total_supply_fast() + total_burnt
+
     current_difficulty = get_current_difficulty()
     hash_rate = get_hash_rate()
-    total_burnt = get_total_burnt()
-    percentage_burnt = total_burnt / total_supply * 100
+    percentage_burnt = (total_burnt / total_supply * 100) if total_supply else 0.0
 
     # Consensus breakdown over the last 100 blocks
     cs = consensus_stats_last_n(100)
@@ -656,7 +659,7 @@ def rich_list():
     c = conn.cursor()
 
     # Circulating Supply (minted – burnt) as basis for the percentage
-    total_supply = calculate_total_supply()
+    total_supply = calculate_total_supply_fast()
 
     # Use balance directly so the index on addresses(balance) can be used for WHERE and ORDER BY.
     c.execute("""
@@ -727,10 +730,10 @@ def get_peers():
 
 @app.route('/api/total_supply')
 def total_supply_api():
-    total_supply = calculate_total_supply()  # This function retrieves the current Total Supply from the database
+    total_supply = calculate_total_supply_fast()
     return jsonify({
         'total_supply': total_supply,
-        'unit': 'HABS'
+        'unit': 'SLM'
     })
 
 
@@ -831,6 +834,7 @@ def consensus_stats_last_n(num_blocks=100):
 
 # New JSON API route for consensus stats
 @app.route('/api/consensus_stats')
+@cache.cached(timeout=300, query_string=True)
 def consensus_stats_api():
     try:
         last = request.args.get('last', default=100, type=int)

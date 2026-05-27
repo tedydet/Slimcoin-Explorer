@@ -305,13 +305,38 @@ def getblockcount():
 def calculate_total_supply_fast():
     """
     Fast total supply estimate for UI views like the rich list.
-    Uses the precomputed address balances instead of scanning all blocks.
+
+    Prefer the cached value written by rebuild_addresses(). If the cache
+    is not present yet, fall back to SUM(addresses.balance) and store the
+    result for future requests. This avoids a full SUM scan during normal
+    web requests.
     """
     with sqlite3.connect(DATABASE, timeout=5) as conn:
         c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS explorer_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+        ''')
+        c.execute("SELECT value FROM explorer_meta WHERE key = 'total_supply_fast'")
+        row = c.fetchone()
+        if row and row[0] is not None:
+            return float(row[0])
+
         c.execute('SELECT SUM(balance) FROM addresses')
         row = c.fetchone()
-        return float(row[0] or 0.0)
+        total_supply = float(row[0] or 0.0)
+        c.execute('''
+            INSERT INTO explorer_meta (key, value, updated_at)
+            VALUES ('total_supply_fast', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+        ''', (str(total_supply), int(datetime.now(timezone.utc).timestamp())))
+        conn.commit()
+        return total_supply
 
 
 def get_block_hash(_block_nr):
@@ -459,6 +484,8 @@ def create_indices(conn):
     c.execute('CREATE INDEX IF NOT EXISTS idx_vin_txid         ON vin(txid)')
     # Help ORDER BY balance DESC LIMIT N on /richlist
     c.execute('CREATE INDEX IF NOT EXISTS idx_addresses_balance ON addresses(balance)')
+    # Cover rich list ordering: WHERE balance > 0 ORDER BY balance DESC, address ASC LIMIT 100
+    c.execute('CREATE INDEX IF NOT EXISTS idx_addresses_balance_desc_addr ON addresses(balance DESC, address ASC)')
 
     c.close()
 
@@ -477,6 +504,7 @@ def drop_indices(conn):
         'idx_vout_blockhash',
         'idx_vin_txid',
         'idx_addresses_balance',
+        'idx_addresses_balance_desc_addr',
     ]:
         c.execute(f'DROP INDEX IF EXISTS {idx}')
     c.close()
@@ -885,6 +913,26 @@ def rebuild_addresses(conn, current_block_height):
                 GROUP BY address
             ) AS u ON r.address = u.address
         ''', (current_block_height,))
+
+        # Cache total supply derived from the freshly rebuilt address balances.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS explorer_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+        ''')
+        c.execute('SELECT IFNULL(SUM(balance), 0) FROM addresses')
+        total_supply_row = c.fetchone()
+        total_supply_fast = float(total_supply_row[0] or 0.0)
+        c.execute('''
+            INSERT INTO explorer_meta (key, value, updated_at)
+            VALUES ('total_supply_fast', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+        ''', (str(total_supply_fast), int(datetime.now(timezone.utc).timestamp())))
+
         conn.commit()
     except Exception as e:
         print(f"Error rebuilding addresses: {e}")
