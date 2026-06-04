@@ -215,7 +215,7 @@ Create the service:
 sudo nano /etc/systemd/system/slimcoin-explorer.service
 ```
 
-Example for user `j4005`:
+Example for user `user1`:
 
 ```ini
 [Unit]
@@ -225,12 +225,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=j4005
-Group=j4005
-WorkingDirectory=/home/j4005/Slimcoin-Explorer
+User=user1
+Group=user1
+WorkingDirectory=/home/user1/Slimcoin-Explorer
 Environment=PYTHONUNBUFFERED=1
-EnvironmentFile=/home/j4005/Slimcoin-Explorer/.env
-ExecStart=/home/j4005/Slimcoin-Explorer/.venv/bin/gunicorn \
+EnvironmentFile=/home/user1/Slimcoin-Explorer/.env
+ExecStart=/home/user1/Slimcoin-Explorer/.venv/bin/gunicorn \
   -w 2 -k gthread --threads 4 --timeout 120 --keep-alive 5 \
   --access-logfile - --error-logfile - \
   -b 127.0.0.1:5005 app:app
@@ -367,12 +367,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=j4005
-Group=j4005
-WorkingDirectory=/home/j4005/Slimcoin-Explorer
+User=user1
+Group=user1
+WorkingDirectory=/home/user1/Slimcoin-Explorer
 Environment=PYTHONUNBUFFERED=1
-EnvironmentFile=/home/j4005/Slimcoin-Explorer/.env
-ExecStart=/home/j4005/Slimcoin-Explorer/.venv/bin/python /home/j4005/Slimcoin-Explorer/update_blocks.py
+EnvironmentFile=/home/user1/Slimcoin-Explorer/.env
+ExecStart=/home/user1/Slimcoin-Explorer/.venv/bin/python /home/user1/Slimcoin-Explorer/update_blocks.py
 Restart=always
 RestartSec=10
 
@@ -608,8 +608,8 @@ sudo systemctl restart slimcoin-explorer
 Check that the service user exists and owns the project:
 
 ```bash
-id j4005
-sudo chown -R j4005:j4005 /home/j4005/Slimcoin-Explorer
+id user1
+sudo chown -R user1:user1 /home/user1/Slimcoin-Explorer
 systemctl cat slimcoin-explorer
 ```
 
