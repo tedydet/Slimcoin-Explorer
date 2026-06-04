@@ -43,7 +43,7 @@ PEERS = 'peers.db'
 def get_db_connection():
     # Open SQLite in read-only mode with shared page cache for faster concurrent reads
     # Note: write operations are performed by the importer; the web app only reads.
-    uri = f"file:{DATABASE}?mode=ro&amp;cache=shared"
+    uri = f"file:{DATABASE}?mode=ro&cache=shared"
     conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     # Light SQLite tuning (no-ops on read-only where unsupported)
